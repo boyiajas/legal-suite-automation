@@ -13,12 +13,14 @@ from dataclasses import dataclass
 import requests
 
 from ftp_download_today import (
+    EXCEL_BASE,
     FTP_HOST,
     FTP_PASS,
     FTP_USER,
     FTPClient,
     LEGALSUITE_API_BASE,
     LEGALSUITE_API_KEY,
+    LEGALSUITE_OFFSET,
 )
 
 
@@ -33,6 +35,77 @@ CLIENT_CODE_MAP = {
     "DR822": "334567",
     "STA614": "267742",
     "DR614": "334569",
+}
+
+CREATE_FIELD_COLUMN_MAP = {
+    "theirref": "Reference",
+    "claimamount": "Claim Amount",
+    "interestrate": "Interest Rate",
+    "employerid": "EmployerID",
+    "tracingagentid": "TracingAgentID",
+    "sheriffareaid": "SheriffAreaID",
+    "sheriffid": "SheriffID",
+    "branchid": "BranchID",
+    "employeeid": "EmployeeID",
+    "stagegroupid": "StageGroupID",
+    "mattertypeid": "MatterTypeID",
+    "debtorfeesheetid": "DebtorFeeSheetID",
+    "clientfeesheetid": "ClientFeeSheetID",
+    "debtorcollcommoption": "DebtorCollCommOption",
+    "debtorcollcommpercent": "DebtorCollCommPercent",
+    "collcommoption": "CollCommOption",
+    "clientcollcommpercent": "ClientCollCommPercent",
+    "costcentreid": "CostCentreID",
+    "defendantemail": "DefendantEmail",
+    "magcourtdistrict": "MagCourtDistrict",
+    "magcourtheldat": "MagCourtHeldAt",
+    "extrascreenid": "ExtraScreenID",
+    "induplumamount": "In Duplum Amount",
+    "maximuminterestamount": "Maximum Interest Amount",
+    "alternateref": "Alternate Reference",
+}
+
+CREATE_DEFAULTS = {
+    "mattertypeid": 4,
+    "clientfeesheetid": 1,
+    "docgenid": 5,
+    "costcentreid": 193,
+    "todogroupid": 1,
+    "stagegroupid": 59,
+    "debtorfeesheetid": 45,
+    "businessbankid": 1103,
+    "trustbankid": 1198,
+    "employeeid": 174,
+    "loggedinemployeeid": 174,
+    "archivestatusdescription": "LIVE",
+    "archivestatus": 2,
+    "partyname": "STANDARD BANK",
+    "employeename": "Angie Reddy",
+    "mattypedescription": "Collections",
+    "docgendescription": "Magistrate Court",
+    "branchdescription": "STRAUSS DALY UMHLANGA",
+    "docgencode": "MAG",
+    "docgentype": "LIT",
+    "costcentredescription": "A Reddy",
+    "planofactiondescription": "Collections",
+    "stagegroupdescription": "Collections APT - E4",
+    "clientfeesheetdescription": "Conveyancing",
+    "debtorfeesheetdescription": "Mag Court Tariff",
+    "backgroundcolour": "FF0000",
+}
+
+PARTY_DEFAULTS = {
+    "party[partytypeid]": 1,
+    "party[defaultlanguageid]": 1,
+    "party[createdid]": 1,
+    "party[parlang][languageid]": 1,
+}
+
+MATPARTY_DEFAULTS = {
+    "roleid": 103,
+    "sorter": 1,
+    "languageid": 0,
+    "reference": "",
 }
 
 XLSX_NS = {
@@ -53,6 +126,16 @@ class DownloadTarget:
     filename_pattern: str
 
 
+@dataclass
+class HandoverRow:
+    source_path: str
+    row_number: int
+    values_by_header: dict[str, object]
+    client_code: str
+    client_id: str
+    reference: str | None
+
+
 class LegalSuiteLookupClient:
     def __init__(self, api_base: str, api_key: str) -> None:
         self._api_base = api_base.rstrip("/")
@@ -68,6 +151,104 @@ class LegalSuiteLookupClient:
         response.raise_for_status()
         payload = response.json()
         return payload.get("data", [])
+
+    def get_matters_by_fileref(self, file_ref: str) -> list[dict]:
+        url = f"{self._api_base}/matter/get"
+        data = {
+            "where[]": f"Matter.FileRef,=,{file_ref}",
+        }
+        response = requests.post(url, headers=self._headers(), data=data, timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("data", [])
+
+    def get_matters_by_clientid_and_reference(self, client_id: str, reference: str) -> list[dict]:
+        url = f"{self._api_base}/matter/get"
+        data = [
+            ("where[]", f"Matter.ClientID,=,{client_id}"),
+            ("where[]", f"Matter.TheirRef,=,{reference}"),
+        ]
+        response = requests.post(url, headers=self._headers(), data=data, timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("data", [])
+
+    def create_matter(self, data: dict) -> dict | str:
+        url = f"{self._api_base}/matter/store"
+        payload = {key: str(value) for key, value in data.items()}
+        response = requests.post(url, headers=self._headers(), data=payload, timeout=60)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
+
+    def get_matter_by_recordid(self, recordid: int | str) -> dict | str:
+        url = f"{self._api_base}/matter/get"
+        data = {
+            "where[]": f"Matter.RecordID,=,{recordid}",
+        }
+        response = requests.post(url, headers=self._headers(), data=data, timeout=60)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
+
+    def update_matter(self, recordid: int | str, updates: dict) -> dict | str:
+        url = f"{self._api_base}/matter/update"
+        payload = {
+            "recordid": str(recordid),
+        }
+        for key, value in updates.items():
+            payload[key] = str(value)
+        response = requests.post(url, headers=self._headers(), data=payload, timeout=60)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
+
+    def create_party(self, data: dict) -> dict | str:
+        url = f"{self._api_base}/party/store"
+        payload = {key: str(value) for key, value in data.items()}
+        response = requests.post(url, headers=self._headers(), data=payload, timeout=60)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
+
+    def get_party_by_identitynumber(self, identity_number: str) -> list[dict]:
+        url = f"{self._api_base}/party/get"
+        data = {
+            "where[]": f"Party.IdentityNumber,=,{identity_number}",
+        }
+        response = requests.post(url, headers=self._headers(), data=data, timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("data", [])
+
+    def get_matparty_by_matter_and_party(self, matter_id: int | str, party_id: int | str) -> list[dict]:
+        url = f"{self._api_base}/matparty/get"
+        data = [
+            ("where[]", f"MatParty.MatterID,=,{matter_id}"),
+            ("where[]", f"MatParty.PartyID,=,{party_id}"),
+        ]
+        response = requests.post(url, headers=self._headers(), data=data, timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("data", [])
+
+    def create_matparty(self, data: dict) -> dict | str:
+        url = f"{self._api_base}/matparty/store"
+        payload = {key: str(value) for key, value in data.items()}
+        response = requests.post(url, headers=self._headers(), data=payload, timeout=60)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -157,13 +338,13 @@ def download_handover_files(
     return downloaded_files
 
 
-def resolve_local_handover_files(date_ctx: DateContext, download_dir: str) -> list[str]:
+def resolve_local_handover_files(date_ctx: DateContext, base_dir: str, label: str = "existing") -> list[str]:
     resolved_files: list[str] = []
 
     for target in build_targets(date_ctx):
         found_path = None
         for remote_dir in target.remote_dirs:
-            local_dir = os.path.join(download_dir, *remote_dir.split("/"))
+            local_dir = os.path.join(base_dir, *remote_dir.split("/"))
             if not os.path.isdir(local_dir):
                 continue
 
@@ -185,9 +366,9 @@ def resolve_local_handover_files(date_ctx: DateContext, download_dir: str) -> li
 
         if found_path:
             resolved_files.append(found_path)
-            print(f"Using existing {target.label}: {found_path}")
+            print(f"Using {label} {target.label}: {found_path}")
         else:
-            print(f"Existing {target.label} file not found for {date_ctx.date_str} in {download_dir}")
+            print(f"{label.capitalize()} {target.label} file not found for {date_ctx.date_str} in {base_dir}")
 
     return resolved_files
 
@@ -215,11 +396,80 @@ def normalize_reference(value: object) -> str | None:
     return text or None
 
 
+def normalize_cell_value(value: object) -> object | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, (dt.datetime, dt.date)):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("'"):
+            text = text[1:].strip()
+        return text or None
+    return value
+
+
+def normalize_money(value: object) -> object | None:
+    value = normalize_cell_value(value)
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    text = str(value).strip()
+    cleaned = re.sub(r"[^0-9.\-]", "", text)
+    if not cleaned or cleaned in {"-", ".", "-."}:
+        return None
+    try:
+        return float(cleaned) if "." in cleaned else int(cleaned)
+    except ValueError:
+        return None
+
+
 def digits_only(value: object) -> str | None:
     if value in (None, ""):
         return None
     digits = "".join(ch for ch in str(value) if ch.isdigit())
     return digits or None
+
+
+def encode_legalsuite_date(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) + LEGALSUITE_OFFSET
+    if isinstance(value, dt.datetime):
+        date_value = value
+    elif isinstance(value, dt.date):
+        date_value = dt.datetime.combine(value, dt.time())
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        date_text = text.split()[0].split("T")[0].replace("/", "-")
+        parts = date_text.split("-")
+        if len(parts) == 3 and all(parts):
+            if len(parts[0]) == 4:
+                date_text = f"{parts[0]}-{parts[1]}-{parts[2]}"
+            elif len(parts[2]) == 4:
+                date_text = f"{parts[2]}-{parts[1]}-{parts[0]}"
+        try:
+            date_value = dt.datetime.strptime(date_text, "%Y-%m-%d")
+        except ValueError:
+            return None
+    excel_serial = (date_value - EXCEL_BASE).days
+    return excel_serial + LEGALSUITE_OFFSET
+
+
+def encode_legalsuite_time(value: dt.datetime | dt.time | None = None) -> int:
+    if value is None:
+        value = dt.datetime.now()
+    if isinstance(value, dt.datetime):
+        time_value = value.time()
+    else:
+        time_value = value
+    return int(time_value.strftime("%H%M%S"))
 
 
 def find_column_index(header_row: tuple[object, ...], expected_name: str) -> int | None:
@@ -289,6 +539,65 @@ def read_client_codes_from_file(path: str) -> tuple[dict[str, int], list[str], d
     return counts, unknown_codes, references_by_code
 
 
+def read_handover_rows_from_file(path: str) -> tuple[list[HandoverRow], list[str]]:
+    rows = iter_excel_rows(path)
+    header_row, client_code_idx, header_row_number = find_header_row(rows, "Client Code")
+    reference_idx = find_column_index(header_row, "Reference")
+    if reference_idx is None:
+        raise ValueError(f"Reference column not found in {path}")
+
+    headers = [str(value).strip() if value not in (None, "") else "" for value in header_row]
+    items: list[HandoverRow] = []
+    unknown_codes: list[str] = []
+
+    for offset, row in enumerate(rows, start=1):
+        row_number = header_row_number + offset
+        raw_client_code = cell_value(row, client_code_idx)
+        if raw_client_code in (None, ""):
+            continue
+
+        client_code = str(raw_client_code).strip().upper()
+        if not client_code or normalize_header(client_code) == "clientcode":
+            continue
+
+        client_id = CLIENT_CODE_MAP.get(client_code)
+        if not client_id:
+            if client_code not in unknown_codes:
+                unknown_codes.append(client_code)
+            continue
+
+        values_by_header: dict[str, object] = {}
+        for idx, header in enumerate(headers):
+            if not header:
+                continue
+            values_by_header[header] = cell_value(row, idx)
+
+        items.append(
+            HandoverRow(
+                source_path=path,
+                row_number=row_number,
+                values_by_header=values_by_header,
+                client_code=client_code,
+                client_id=client_id,
+                reference=normalize_reference(cell_value(row, reference_idx)),
+            )
+        )
+
+    return items, unknown_codes
+
+
+def read_handover_rows(paths: list[str]) -> tuple[list[HandoverRow], list[str]]:
+    all_rows: list[HandoverRow] = []
+    unknown_codes: list[str] = []
+    for path in paths:
+        file_rows, file_unknown_codes = read_handover_rows_from_file(path)
+        all_rows.extend(file_rows)
+        for code in file_unknown_codes:
+            if code not in unknown_codes:
+                unknown_codes.append(code)
+    return all_rows, unknown_codes
+
+
 def clean_handover_files(paths: list[str], download_dir: str, cleaned_dir: str) -> list[str]:
     cleaned_paths: list[str] = []
 
@@ -308,6 +617,7 @@ def clean_handover_file(source_path: str, destination_path: str) -> None:
         from openpyxl import load_workbook
     except ImportError:
         shutil.copy2(source_path, destination_path)
+        print("Cleaning skipped: openpyxl is not installed; copied file without changes.", file=sys.stderr)
         return
 
     workbook = load_workbook(source_path)
@@ -316,41 +626,38 @@ def clean_handover_file(source_path: str, destination_path: str) -> None:
             workbook.save(destination_path)
             return
 
-        worksheet = workbook.worksheets[0]
-        header_values: tuple[object, ...] | None = None
-        header_row_number = None
+        for worksheet in workbook.worksheets:
+            header_values: tuple[object, ...] | None = None
+            header_row_number = None
 
-        for row_number, row in enumerate(
-            worksheet.iter_rows(min_row=1, max_row=min(10, worksheet.max_row), values_only=True),
-            start=1,
-        ):
-            if find_column_index(tuple(row), "Client Code") is not None:
-                header_values = tuple(row)
-                header_row_number = row_number
-                break
+            for row_number, row in enumerate(
+                worksheet.iter_rows(min_row=1, max_row=min(10, worksheet.max_row), values_only=True),
+                start=1,
+            ):
+                row_values = tuple(row)
+                if find_column_index(row_values, "Client Code") is not None:
+                    header_values = row_values
+                    header_row_number = row_number
+                    break
 
-        if not header_values or not header_row_number:
-            workbook.save(destination_path)
-            return
+            if not header_values or not header_row_number:
+                continue
 
-        reference_idx = find_column_index(header_values, "Reference")
-        account_idx = find_column_index(header_values, "Account number")
+            reference_idx = find_column_index(header_values, "Reference")
+            account_idx = find_column_index(header_values, "Account number")
+            if reference_idx is None or account_idx is None:
+                continue
 
-        for row_number in range(header_row_number + 1, worksheet.max_row + 1):
-            reference_value = None
-            if reference_idx is not None:
+            for row_number in range(header_row_number + 1, worksheet.max_row + 1):
                 reference_cell = worksheet.cell(row=row_number, column=reference_idx + 1)
-                reference_value = normalize_reference(reference_cell.value)
-                if reference_value is not None:
-                    reference_cell.value = reference_value
-
-            if account_idx is not None:
                 account_cell = worksheet.cell(row=row_number, column=account_idx + 1)
-                normalized_account = digits_only(account_cell.value)
-                if not normalized_account and reference_value is not None:
-                    normalized_account = digits_only(reference_value)
-                if normalized_account is not None:
-                    account_cell.value = normalized_account
+
+                if account_cell.value != reference_cell.value:
+                    account_cell.value = reference_cell.value
+
+                cleaned_account = digits_only(account_cell.value)
+                if cleaned_account != account_cell.value:
+                    account_cell.value = cleaned_account
 
         workbook.save(destination_path)
     finally:
@@ -495,10 +802,336 @@ def find_latest_fileref(matters: list[dict], prefix: str) -> tuple[str | None, s
     return best_ref, next_ref
 
 
-def process_handover_files(paths: list[str], api_base: str, api_key: str) -> int:
+def next_ref_sequence_start(next_ref: str) -> tuple[int, int]:
+    match = re.search(r"/(\d+)$", next_ref)
+    if not match:
+        return 1, 4
+    digits = match.group(1)
+    return int(digits), max(4, len(digits))
+
+
+def get_row_value(row: HandoverRow, header_name: str) -> object | None:
+    expected_key = normalize_header(header_name)
+    for key, value in row.values_by_header.items():
+        if normalize_header(key) == expected_key:
+            return value
+    return None
+
+
+def build_debtor_name(row: HandoverRow) -> str | None:
+    surname = normalize_cell_value(get_row_value(row, "Debtor Surname"))
+    first_name = normalize_cell_value(get_row_value(row, "Debtor First Name"))
+    name_parts = [str(value) for value in (surname, first_name) if value not in (None, "")]
+    if name_parts:
+        return " ".join(name_parts)
+    return None
+
+
+def build_description(row: HandoverRow) -> str:
+    debtor_name = build_debtor_name(row)
+    if debtor_name:
+        return debtor_name
+    matter_description = normalize_cell_value(get_row_value(row, "Matter Description"))
+    if matter_description:
+        return str(matter_description)
+    if row.reference:
+        return row.reference
+    return "New Matter"
+
+
+def build_party_prefix(row: HandoverRow) -> str:
+    surname = normalize_cell_value(get_row_value(row, "Debtor Surname"))
+    base_text = str(surname or build_description(row) or "PTY")
+    letters = "".join(ch for ch in base_text.upper() if ch.isalpha())
+    prefix = (letters[:3] or "PTY").ljust(3, "X")
+
+    suffix_source = digits_only(row.reference) or digits_only(get_row_value(row, "ID Number")) or str(row.row_number)
+    suffix = suffix_source[-3:].rjust(3, "0")
+    return f"{prefix}{suffix}"
+
+
+def build_matter_create_payload(
+    row: HandoverRow,
+    file_ref: str,
+    date_ctx: DateContext,
+    logged_in_employee_id: str,
+) -> dict[str, object]:
+    now = dt.datetime.now()
+    payload: dict[str, object] = {}
+    payload.update(CREATE_DEFAULTS)
+    payload["clientid"] = row.client_id
+    payload["fileref"] = file_ref
+    payload["description"] = build_description(row)
+    payload["dateinstructed"] = encode_legalsuite_date(dt.datetime.strptime(date_ctx.date_str, "%Y%m%d"))
+    payload["updatedbydate"] = encode_legalsuite_date(now)
+    payload["updatedbytime"] = encode_legalsuite_time(now)
+    payload["partymatterprefix"] = row.client_code
+    payload["internalcomment"] = (
+        f"Imported from handover file on "
+        f"{dt.datetime.strptime(date_ctx.date_str, '%Y%m%d').strftime('%d %B %Y')}"
+    )
+    payload["loggedinemployeeid"] = logged_in_employee_id
+
+    for field_name, header_name in CREATE_FIELD_COLUMN_MAP.items():
+        raw_value = get_row_value(row, header_name)
+        if raw_value in (None, ""):
+            continue
+        value = normalize_reference(raw_value) if field_name == "theirref" else normalize_cell_value(raw_value)
+        if value not in (None, ""):
+            payload[field_name] = value
+
+    if row.reference:
+        payload["theirref"] = row.reference
+
+    claim_amount = normalize_money(get_row_value(row, "Claim Amount"))
+    if claim_amount is not None:
+        payload["claimamount"] = claim_amount
+        payload["debtorsbalance"] = claim_amount
+        payload["debtorsopeningbalance"] = claim_amount
+        payload["interestonamount"] = claim_amount
+        payload["debtorscapitalbalance"] = claim_amount
+
+    return {key: value for key, value in payload.items() if value not in (None, "")}
+
+
+def build_matter_description_update_payload(
+    create_payload: dict[str, object],
+    logged_in_employee_id: str,
+) -> dict[str, object]:
+    payload = {
+        "clientid": create_payload.get("clientid"),
+        "archivestatusdescription": "Live",
+        "loggedinemployeeid": logged_in_employee_id,
+        "mattertypeid": create_payload.get("mattertypeid", CREATE_DEFAULTS["mattertypeid"]),
+        "clientfeesheetid": create_payload.get("clientfeesheetid", CREATE_DEFAULTS["clientfeesheetid"]),
+        "docgenid": create_payload.get("docgenid", CREATE_DEFAULTS["docgenid"]),
+        "archiveflag": 0,
+        "archivestatus": 0,
+        "archiveno": 0,
+        "description": create_payload.get("description"),
+    }
+    return {key: value for key, value in payload.items() if value not in (None, "")}
+
+
+def add_payload_value(payload: dict[str, object], field_name: str, value: object) -> None:
+    normalized = normalize_cell_value(value)
+    if normalized not in (None, ""):
+        payload[field_name] = normalized
+
+
+def build_party_create_payload(
+    row: HandoverRow,
+    date_ctx: DateContext,
+    logged_in_employee_id: str,
+) -> dict[str, object]:
+    now = dt.datetime.now()
+    name = build_debtor_name(row) or build_description(row)
+    imported_date = dt.datetime.strptime(date_ctx.date_str, "%Y%m%d")
+    notes = f"Imported on {imported_date.strftime('%d %B %Y')}"
+
+    payload: dict[str, object] = {}
+    payload.update(PARTY_DEFAULTS)
+    payload["party[name]"] = name
+    payload["party[matterprefix]"] = build_party_prefix(row)
+    payload["party[updatedbydate]"] = encode_legalsuite_date(now)
+    payload["party[updatedbytime]"] = encode_legalsuite_time(now)
+    payload["party[createdid]"] = logged_in_employee_id
+    payload["party[notes]"] = notes
+
+    identity_number = digits_only(get_row_value(row, "ID Number"))
+    if identity_number:
+        payload["party[identitynumber]"] = identity_number
+
+    add_payload_value(payload, "party[parlang][salutation]", get_row_value(row, "Debtor Title"))
+
+    add_payload_value(payload, "party[parlang][physicalline1]", get_row_value(row, "Physical Address Line 1"))
+    add_payload_value(payload, "party[parlang][physicalline2]", get_row_value(row, "Physical Address Line 2"))
+    add_payload_value(payload, "party[parlang][physicalline3]", get_row_value(row, "Physical Address Line 3"))
+    add_payload_value(payload, "party[parlang][physicalcode]", get_row_value(row, "Physical Postal Code"))
+    add_payload_value(payload, "party[parlang][postalline1]", get_row_value(row, "Postal Address Line 1"))
+    add_payload_value(payload, "party[parlang][postalline2]", get_row_value(row, "Postal Address Line 2"))
+    add_payload_value(payload, "party[parlang][postalline3]", get_row_value(row, "Postal Address Line 3"))
+    add_payload_value(payload, "party[parlang][postalcode]", get_row_value(row, "Postal Code"))
+    add_payload_value(payload, "party[parlang][homenumber]", get_row_value(row, "Telephone (Home)"))
+    add_payload_value(payload, "party[parlang][worknumber]", get_row_value(row, "Telephone (Work)"))
+    add_payload_value(payload, "party[parlang][cellnumber]", get_row_value(row, "Cell Phone"))
+    add_payload_value(payload, "party[parlang][emailaddress]", get_row_value(row, "DefendantEmail"))
+
+    return {key: value for key, value in payload.items() if value not in (None, "")}
+
+
+def build_matparty_create_payload(matterid: int | str, partyid: int | str) -> dict[str, object]:
+    return {
+        "matterid": matterid,
+        "partyid": partyid,
+        **MATPARTY_DEFAULTS,
+    }
+
+
+def extract_created_recordid(created_response: dict | str) -> str:
+    if not isinstance(created_response, dict):
+        raise ValueError(f"Unexpected create response: {created_response}")
+    data = created_response.get("data")
+    if not isinstance(data, list) or not data:
+        raise ValueError(f"Create response has no data row: {created_response}")
+    recordid = data[0].get("recordid")
+    if not recordid:
+        raise ValueError(f"Create response has no recordid: {created_response}")
+    return str(recordid)
+
+
+def extract_fetched_row(fetched_response: dict | str) -> dict:
+    if not isinstance(fetched_response, dict):
+        raise ValueError(f"Unexpected fetch response: {fetched_response}")
+    data = fetched_response.get("data")
+    if not isinstance(data, list) or not data:
+        raise ValueError(f"Fetch response has no data row: {fetched_response}")
+    return data[0]
+
+
+def compare_fields(sent_data: dict, returned_data: dict) -> dict[str, dict[str, object]]:
+    missing_or_changed: dict[str, dict[str, object]] = {}
+
+    for key, sent_value in sent_data.items():
+        returned_value = returned_data.get(key)
+        if str(returned_value) != str(sent_value):
+            missing_or_changed[key] = {
+                "sent": sent_value,
+                "returned": returned_value,
+            }
+
+    return missing_or_changed
+
+
+def find_existing_matter_for_row(
+    client: LegalSuiteLookupClient,
+    row: HandoverRow,
+    file_ref: str,
+) -> dict | None:
+    fileref_matches = client.get_matters_by_fileref(file_ref)
+    if fileref_matches:
+        return fileref_matches[0]
+
+    if row.reference:
+        reference_matches = client.get_matters_by_clientid_and_reference(row.client_id, row.reference)
+        if reference_matches:
+            return reference_matches[0]
+
+    return None
+
+
+def create_and_update_handover_matters(
+    rows: list[HandoverRow],
+    next_refs_by_code: dict[str, str],
+    client: LegalSuiteLookupClient,
+    date_ctx: DateContext,
+    logged_in_employee_id: str,
+    create_matters: bool,
+    create_limit: int | None,
+) -> None:
+    next_numbers: dict[str, tuple[int, int]] = {
+        code: next_ref_sequence_start(next_ref)
+        for code, next_ref in next_refs_by_code.items()
+    }
+
+    processed_count = 0
+    print("\nMatter create/update:")
+    for row in rows:
+        if create_limit is not None and processed_count >= create_limit:
+            print(f"Create limit reached: {create_limit}")
+            break
+        processed_count += 1
+
+        next_number, width = next_numbers[row.client_code]
+        file_ref = f"{row.client_code}/{next_number:0{width}d}"
+        next_numbers[row.client_code] = (next_number + 1, width)
+        payload = build_matter_create_payload(row, file_ref, date_ctx, logged_in_employee_id)
+        party_payload = build_party_create_payload(row, date_ctx, logged_in_employee_id)
+
+        print(
+            f"- {row.client_code} row {row.row_number} | reference {row.reference or ''} | "
+            f"new fileref {file_ref}"
+        )
+
+        print("  Checking for existing matter...")
+        existing_matter = find_existing_matter_for_row(client, row, file_ref)
+        if existing_matter:
+            print(
+                "  Skipped: matter already exists "
+                f"recordid {existing_matter.get('recordid')} "
+                f"fileref {existing_matter.get('fileref')} "
+                f"theirref {existing_matter.get('theirref')}"
+            )
+            continue
+
+        if not create_matters:
+            print("  Dry-run: would create matter.")
+            print("  Dry-run: would update matter description.")
+            print("  Dry-run: would create or reuse party.")
+            print("  Dry-run: would create MatParty link if missing.")
+            continue
+
+        print("  Creating matter...")
+        created = client.create_matter(payload)
+        recordid = extract_created_recordid(created)
+        print(f"  Created matter recordid: {recordid}")
+
+        print("  Updating matter description...")
+        update_payload = build_matter_description_update_payload(payload, logged_in_employee_id)
+        client.update_matter(recordid, update_payload)
+        print("  Updated matter description")
+
+        create_parties = True
+        if not create_parties:
+            print("  Party and MatParty creation skipped for preview.")
+            continue
+
+        print("  Checking for existing party...")
+        identity_number = digits_only(get_row_value(row, "ID Number"))
+        existing_party = None
+        if identity_number:
+            matches = client.get_party_by_identitynumber(identity_number)
+            if matches:
+                existing_party = matches[0]
+
+        if existing_party:
+            partyid = str(existing_party["recordid"])
+            print(f"  Reusing existing partyid: {partyid}")
+        else:
+            print("  Creating party...")
+            created_party = client.create_party(party_payload)
+            partyid = extract_created_recordid(created_party)
+            print(f"  Created partyid: {partyid}")
+
+        print("  Checking MatParty link...")
+        existing_matparty = client.get_matparty_by_matter_and_party(recordid, partyid)
+        if existing_matparty:
+            print(
+                "  MatParty link already exists: "
+                f"recordid {existing_matparty[0].get('recordid')}"
+            )
+        else:
+            print("  Creating MatParty link...")
+            matparty_payload = build_matparty_create_payload(recordid, partyid)
+            created_matparty = client.create_matparty(matparty_payload)
+            matparty_recordid = extract_created_recordid(created_matparty)
+            print(f"  Linked matparty recordid: {matparty_recordid}")
+
+
+def process_handover_files(
+    paths: list[str],
+    api_base: str,
+    api_key: str,
+    date_ctx: DateContext,
+    create_matters: bool,
+    create_dry_run: bool,
+    create_limit: int | None,
+    logged_in_employee_id: str,
+) -> int:
     code_counts: dict[str, int] = {}
     unknown_codes: list[str] = []
     code_references: dict[str, list[str]] = {}
+    next_refs_by_code: dict[str, str] = {}
 
     for path in paths:
         file_counts, file_unknown_codes, file_references = read_client_codes_from_file(path)
@@ -531,6 +1164,7 @@ def process_handover_files(paths: list[str], api_base: str, api_key: str) -> int
 
         matters = client.get_matters_by_clientid_and_prefix(client_id, client_code)
         latest_ref, next_ref = find_latest_fileref(matters, client_code)
+        next_refs_by_code[client_code] = next_ref
         if latest_ref:
             print(
                 f"- {client_code} -> clientid {client_id} | rows {code_counts[client_code]} | "
@@ -544,6 +1178,23 @@ def process_handover_files(paths: list[str], api_base: str, api_key: str) -> int
         references = code_references.get(client_code, [])
         if references:
             print(f"  Reference values: {', '.join(references)}")
+
+    if create_matters or create_dry_run:
+        rows, row_unknown_codes = read_handover_rows(paths)
+        for code in row_unknown_codes:
+            if code not in unknown_codes:
+                unknown_codes.append(code)
+        if unknown_codes:
+            print("Rows skipped for unknown client codes:", ", ".join(sorted(unknown_codes)))
+        create_and_update_handover_matters(
+            rows=rows,
+            next_refs_by_code=next_refs_by_code,
+            client=client,
+            date_ctx=date_ctx,
+            logged_in_employee_id=logged_in_employee_id,
+            create_matters=create_matters,
+            create_limit=create_limit,
+        )
 
     return 0
 
@@ -609,6 +1260,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.getenv("LEGALSUITE_API_KEY") or LEGALSUITE_API_KEY,
         help="LegalSuite API key.",
     )
+    parser.add_argument(
+        "--logged-in-employee-id",
+        default=str(CREATE_DEFAULTS["loggedinemployeeid"]),
+        help="LegalSuite logged-in employee ID for created/updated matters (default: 1).",
+    )
+    parser.add_argument(
+        "--create-dry-run",
+        action="store_true",
+        help="Build and print matter/store payloads without creating matters.",
+    )
+    parser.add_argument(
+        "--create-matters",
+        action="store_true",
+        help="Create matters in LegalSuite, fetch them by recordid, then update fields that did not save.",
+    )
+    parser.add_argument(
+        "--create-limit",
+        type=int,
+        help="Limit how many handover rows are created or previewed.",
+    )
     return parser.parse_args(normalize_cli_args(argv))
 
 
@@ -619,20 +1290,37 @@ def main() -> int:
         print(f"Target date: {date_ctx.date_str}")
         print(f"Panel month folder: {date_ctx.month_year}")
         if args.clean_only:
-            source_files = resolve_local_handover_files(date_ctx, args.download_dir)
+            working_files = resolve_local_handover_files(date_ctx, args.cleaned_dir, label="cleaned")
+            if not working_files:
+                print("No cleaned handover files were available; checking downloaded files.")
+                source_files = resolve_local_handover_files(date_ctx, args.download_dir)
+                if not source_files:
+                    print("No handover files were available.")
+                    return 1
+                if args.skip_clean:
+                    working_files = source_files
+                else:
+                    working_files = clean_handover_files(source_files, args.download_dir, args.cleaned_dir)
         else:
             source_files = download_handover_files(date_ctx, args.download_dir, args.timeout)
+            if not source_files:
+                print("No handover files were available.")
+                return 1
+            if args.skip_clean:
+                working_files = source_files
+            else:
+                working_files = clean_handover_files(source_files, args.download_dir, args.cleaned_dir)
 
-        if not source_files:
-            print("No handover files were available.")
-            return 1
-
-        if args.skip_clean:
-            working_files = source_files
-        else:
-            working_files = clean_handover_files(source_files, args.download_dir, args.cleaned_dir)
-
-        return process_handover_files(working_files, args.api_base, args.api_key)
+        return process_handover_files(
+            paths=working_files,
+            api_base=args.api_base,
+            api_key=args.api_key,
+            date_ctx=date_ctx,
+            create_matters=args.create_matters,
+            create_dry_run=args.create_dry_run,
+            create_limit=args.create_limit,
+            logged_in_employee_id=args.logged_in_employee_id,
+        )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2

@@ -127,6 +127,12 @@ This script downloads LegalSuite FTP files for a given date, cleans them, and op
   - Fetches matching matters from LegalSuite and finds the highest `FileRef` suffix.
   - Prints the latest matter ref and the next ref that would be used.
 
+- Preview matter creation without writing to LegalSuite:
+  - `python3 handover_file_processing_test.py --date 20260219 --clean-only --create-dry-run --create-limit 1`
+
+- Create matters in LegalSuite, then fetch and update changed fields, create debtor party data, and link the debtor to the matter through `matparty/store`:
+  - `python3 handover_file_processing_test.py --date 20260219 --clean-only --create-matters`
+
 - Notes:
-  - It does not create or update matters in LegalSuite.
+  - It does not create matters, parties, or matparty links in LegalSuite unless `--create-matters` is supplied.
   - It includes a fallback for the current FTP Debt Review handover folder typo: `Debt_Review_ Handover_APT_LWS`.

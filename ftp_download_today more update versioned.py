@@ -9,6 +9,10 @@ import sys
 import warnings
 from typing import Callable
 
+from env_config import load_env_file
+
+load_env_file()
+
 try:
     from openpyxl import Workbook, load_workbook
 except ImportError:  # pragma: no cover - handled at runtime
@@ -21,15 +25,9 @@ else:
         module="openpyxl.styles.stylesheet",
     )
 
-#test remote box
-#FTP_HOST = "www23.jnb2.host-h.net"
-#FTP_USER = "martcfeapf"
-#FTP_PASS = "9MM4vkAr8j8BZ8L75fS6"
-
-#live remote box 
-FTP_HOST = "197.189.198.106"
-FTP_USER = "lswapt@iconis.co.za"
-FTP_PASS = "4Ax5Qqr0V8eT0rGR3z7fvW5x"
+FTP_HOST = os.getenv("FTP_HOST", "")
+FTP_USER = os.getenv("FTP_USER", "")
+FTP_PASS = os.getenv("FTP_PASS", "")
 
 TARGETS = [
     ("SBSA/Debt Review/Debt_Review_Close_APT_LSW", "Standard_Bank_Panel_L_Close_{date}_DR.xlsx"),

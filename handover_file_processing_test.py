@@ -130,6 +130,8 @@ class DownloadTarget:
 class HandoverRow:
     source_path: str
     row_number: int
+    headers: list[str]
+    row_values: tuple[object, ...]
     values_by_header: dict[str, object]
     client_code: str
     client_id: str
@@ -249,6 +251,27 @@ class LegalSuiteLookupClient:
             return response.json()
         except ValueError:
             return response.text
+
+    def update_matter_extrascreen(self, data: dict) -> dict | str:
+        url = f"{self._api_base}/matdocsc/update"
+        payload = {key: str(value) for key, value in data.items()}
+        response = requests.post(url, headers=self._headers(), data=payload, timeout=60)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
+
+    def get_matter_extrascreen(self, matter_id: int | str, docscreenid: int | str) -> list[dict]:
+        url = f"{self._api_base}/matdocsc/get"
+        data = [
+            ("where[]", f"MatDocSc.MatterID,=,{matter_id}"),
+            ("where[]", f"MatDocSc.DocScreenID,=,{docscreenid}"),
+        ]
+        response = requests.post(url, headers=self._headers(), data=data, timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("data", [])
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -447,6 +470,8 @@ def encode_legalsuite_date(value: object) -> int | None:
         text = str(value).strip()
         if not text:
             return None
+        if re.fullmatch(r"-?\d+(?:\.0+)?", text):
+            return int(float(text)) + LEGALSUITE_OFFSET
         date_text = text.split()[0].split("T")[0].replace("/", "-")
         parts = date_text.split("-")
         if len(parts) == 3 and all(parts):
@@ -576,6 +601,8 @@ def read_handover_rows_from_file(path: str) -> tuple[list[HandoverRow], list[str
             HandoverRow(
                 source_path=path,
                 row_number=row_number,
+                headers=headers,
+                row_values=tuple(row),
                 values_by_header=values_by_header,
                 client_code=client_code,
                 client_id=client_id,
@@ -909,6 +936,11 @@ def build_matter_description_update_payload(
         "archivestatus": 0,
         "archiveno": 0,
         "description": create_payload.get("description"),
+        "claimamount": create_payload.get("claimamount"),
+        "debtorsbalance": create_payload.get("debtorsbalance"),
+        "debtorsopeningbalance": create_payload.get("debtorsopeningbalance"),
+        "interestonamount": create_payload.get("interestonamount"),
+        "debtorscapitalbalance": create_payload.get("debtorscapitalbalance"),
     }
     return {key: value for key, value in payload.items() if value not in (None, "")}
 
@@ -968,6 +1000,62 @@ def build_matparty_create_payload(matterid: int | str, partyid: int | str) -> di
     }
 
 
+def header_has_date_semantics(header_name: str) -> bool:
+    return "date" in normalize_header(header_name)
+
+
+def build_desktop_extrascreen_payloads(row: HandoverRow) -> list[tuple[str, dict[str, object]]]:
+    payloads: list[tuple[str, dict[str, object]]] = []
+    current_screen_label: str | None = None
+    current_payload: dict[str, object] | None = None
+
+    def flush_current() -> None:
+        nonlocal current_screen_label, current_payload
+        if current_screen_label and current_payload and len(current_payload) > 1:
+            payloads.append((current_screen_label, current_payload))
+        current_screen_label = None
+        current_payload = None
+
+    for header_name, raw_value in zip(row.headers, row.row_values):
+        if not header_name:
+            continue
+
+        screen_match = re.fullmatch(r"DesktopExtraScreenID(\d+)", header_name.strip(), re.IGNORECASE)
+        if screen_match:
+            flush_current()
+            screen_id = normalize_reference(raw_value)
+            if screen_id:
+                current_screen_label = f"DesktopExtraScreenID{screen_match.group(1)}"
+                current_payload = {"docscreenid": screen_id}
+            continue
+
+        if current_payload is None:
+            continue
+
+        field_match = re.match(r"Desktop Extra Field\s+(\d+)\b", header_name.strip(), re.IGNORECASE)
+        if not field_match:
+            continue
+
+        field_number = int(field_match.group(1))
+        field_name = f"field{field_number}"
+        if raw_value in (None, ""):
+            continue
+
+        if header_has_date_semantics(header_name):
+            encoded = encode_legalsuite_date(raw_value)
+            if encoded is None:
+                continue
+            current_payload[field_name] = encoded
+        else:
+            normalized = normalize_cell_value(raw_value)
+            if normalized in (None, ""):
+                continue
+            current_payload[field_name] = normalized
+
+    flush_current()
+    return payloads
+
+
 def extract_created_recordid(created_response: dict | str) -> str:
     if not isinstance(created_response, dict):
         raise ValueError(f"Unexpected create response: {created_response}")
@@ -987,6 +1075,62 @@ def extract_fetched_row(fetched_response: dict | str) -> dict:
     if not isinstance(data, list) or not data:
         raise ValueError(f"Fetch response has no data row: {fetched_response}")
     return data[0]
+
+
+def fetch_matter_row(
+    client: LegalSuiteLookupClient,
+    recordid: int | str,
+) -> dict:
+    fetched = client.get_matter_by_recordid(recordid)
+    return extract_fetched_row(fetched)
+
+
+def fetch_matter_claimamount(
+    client: LegalSuiteLookupClient,
+    recordid: int | str,
+) -> object | None:
+    matter_row = fetch_matter_row(client, recordid)
+    return matter_row.get("claimamount")
+
+
+def normalize_compare_value(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def find_changed_fields(
+    before: dict,
+    after: dict,
+    field_names: list[str],
+) -> list[tuple[str, object, object]]:
+    changes: list[tuple[str, object, object]] = []
+    for field_name in field_names:
+        before_value = before.get(field_name)
+        after_value = after.get(field_name)
+        if normalize_compare_value(before_value) != normalize_compare_value(after_value):
+            changes.append((field_name, before_value, after_value))
+    return changes
+
+
+def compare_extrascreen_payload_to_row(payload: dict[str, object], fetched_row: dict) -> list[tuple[str, object, object]]:
+    field_names = sorted(key for key in payload if key.startswith("field"))
+    mismatches: list[tuple[str, object, object]] = []
+    for field_name in field_names:
+        sent_value = payload.get(field_name)
+        fetched_value = fetched_row.get(field_name)
+        if normalize_compare_value(sent_value) != normalize_compare_value(fetched_value):
+            mismatches.append((field_name, sent_value, fetched_value))
+    return mismatches
+
+
+def describe_extrascreen_field_values(row: dict, field_names: list[str]) -> str:
+    parts: list[str] = []
+    for field_name in field_names:
+        value = row.get(field_name)
+        if normalize_compare_value(value):
+            parts.append(f"{field_name}={value}")
+    return ", ".join(parts) if parts else "<all blank>"
 
 
 def compare_fields(sent_data: dict, returned_data: dict) -> dict[str, dict[str, object]]:
@@ -1018,6 +1162,59 @@ def find_existing_matter_for_row(
             return reference_matches[0]
 
     return None
+
+
+def update_handover_row_desktop_extrascreens(
+    client: LegalSuiteLookupClient,
+    row: HandoverRow,
+    matter_recordid: int | str,
+    dry_run: bool,
+) -> None:
+    payloads = build_desktop_extrascreen_payloads(row)
+    if not payloads:
+        print("  No desktop extrascreen data to update.")
+        return
+
+    for screen_label, payload in payloads:
+        docscreenid = payload["docscreenid"]
+        field_names = sorted(key for key in payload if key.startswith("field"))
+        print(
+            f"  Processing {screen_label}: docscreenid={docscreenid} | "
+            f"fields={len(field_names)}"
+        )
+        if dry_run:
+            print(f"  Dry-run: would update {screen_label}.")
+            continue
+
+        update_payload = {"matterid": matter_recordid, **payload}
+        client.update_matter_extrascreen(update_payload)
+        print(f"  Updated {screen_label}")
+        fetched_rows = client.get_matter_extrascreen(matter_recordid, docscreenid)
+        if not fetched_rows:
+            print(f"  No data returned for {screen_label} after update.")
+            continue
+
+        fetched_row = fetched_rows[0]
+        mismatches = compare_extrascreen_payload_to_row(payload, fetched_row)
+        if mismatches:
+            field_names = ", ".join(field_name for field_name, _, _ in mismatches)
+            print(f"  {screen_label} mismatched fields after update: {field_names}")
+            for field_name, sent_value, fetched_value in mismatches:
+                print(f"    {field_name}: sent={sent_value!r} fetched={fetched_value!r}")
+            print(
+                "  Returned extrascreen values: "
+                f"{describe_extrascreen_field_values(fetched_row, sorted(key for key in payload if key.startswith('field')))}"
+            )
+        else:
+            updated_fields = sorted(key for key in payload if key.startswith("field"))
+            if updated_fields:
+                print(f"  {screen_label} fields verified after update: {', '.join(updated_fields)}")
+                print(
+                    "  Returned extrascreen values: "
+                    f"{describe_extrascreen_field_values(fetched_row, updated_fields)}"
+                )
+            else:
+                print(f"  {screen_label} had no field values to verify.")
 
 
 def create_and_update_handover_matters(
@@ -1056,12 +1253,14 @@ def create_and_update_handover_matters(
         print("  Checking for existing matter...")
         existing_matter = find_existing_matter_for_row(client, row, file_ref)
         if existing_matter:
+            existing_recordid = str(existing_matter.get("recordid"))
             print(
                 "  Skipped: matter already exists "
-                f"recordid {existing_matter.get('recordid')} "
+                f"recordid {existing_recordid} "
                 f"fileref {existing_matter.get('fileref')} "
                 f"theirref {existing_matter.get('theirref')}"
             )
+            update_handover_row_desktop_extrascreens(client, row, existing_recordid, dry_run=not create_matters)
             continue
 
         if not create_matters:
@@ -1069,17 +1268,31 @@ def create_and_update_handover_matters(
             print("  Dry-run: would update matter description.")
             print("  Dry-run: would create or reuse party.")
             print("  Dry-run: would create MatParty link if missing.")
+            update_handover_row_desktop_extrascreens(client, row, "<created-matter-recordid>", dry_run=True)
             continue
 
         print("  Creating matter...")
         created = client.create_matter(payload)
         recordid = extract_created_recordid(created)
         print(f"  Created matter recordid: {recordid}")
+        matter_after_create = fetch_matter_row(client, recordid)
+        claimamount_after_create = matter_after_create.get("claimamount")
+        print(f"  Matter claimamount after create: {claimamount_after_create}")
 
         print("  Updating matter description...")
         update_payload = build_matter_description_update_payload(payload, logged_in_employee_id)
         client.update_matter(recordid, update_payload)
         print("  Updated matter description")
+        matter_after_update = fetch_matter_row(client, recordid)
+        claimamount_after_update = matter_after_update.get("claimamount")
+        print(f"  Matter claimamount after description update: {claimamount_after_update}")
+        tracked_fields = sorted(set(payload) | {"claimamount", "debtorsbalance", "debtorsopeningbalance", "interestonamount", "debtorscapitalbalance"})
+        changed_after_update = find_changed_fields(matter_after_create, matter_after_update, tracked_fields)
+        if changed_after_update:
+            changed_names = ", ".join(field_name for field_name, _, _ in changed_after_update)
+            print(f"  Fields changed after description update: {changed_names}")
+        else:
+            print("  No tracked matter fields changed after description update.")
 
         create_parties = True
         if not create_parties:
@@ -1116,6 +1329,18 @@ def create_and_update_handover_matters(
             created_matparty = client.create_matparty(matparty_payload)
             matparty_recordid = extract_created_recordid(created_matparty)
             print(f"  Linked matparty recordid: {matparty_recordid}")
+
+        matter_after_matparty = fetch_matter_row(client, recordid)
+        claimamount_after_matparty = matter_after_matparty.get("claimamount")
+        print(f"  Matter claimamount after MatParty step: {claimamount_after_matparty}")
+        changed_after_matparty = find_changed_fields(matter_after_update, matter_after_matparty, tracked_fields)
+        if changed_after_matparty:
+            changed_names = ", ".join(field_name for field_name, _, _ in changed_after_matparty)
+            print(f"  Fields changed after MatParty step: {changed_names}")
+        else:
+            print("  No tracked matter fields changed after MatParty step.")
+
+        update_handover_row_desktop_extrascreens(client, row, recordid, dry_run=False)
 
 
 def process_handover_files(

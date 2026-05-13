@@ -1,4 +1,6 @@
 /downloads
+.codex
+/verification
 /cleaned
 /__pycache__
 /.venv

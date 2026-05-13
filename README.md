@@ -1,138 +1,418 @@
-# FTP Download Automation Notes
+# FTP Download Automation
 
-This script downloads LegalSuite FTP files for a given date, cleans them, and optionally updates closed matters or Matter ExtraScreen data in LegalSuite.
+`ftp_download_today.py` is the main daily automation script for:
 
-## How it works (step-by-step)
+- downloading LegalSuite source files from FTP
+- cleaning and converting the downloaded files
+- processing handover files
+- updating matter extrascreens
+- updating claim amounts
+- archiving closed matters
+- reopening matters from reopen files
+- verifying that LegalSuite updates actually stuck after each update call
 
-1. Resolve the target date.
-   - Uses `--date YYYYMMDD` if provided.
-   - Otherwise uses `--days-ago N` (default 0 = today).
+## Configuration
 
-2. Build the FTP target list.
-   - Fills in date placeholders in each remote path and filename template.
-   - Supports wildcard filenames (e.g., `*_{date}.xlsx`) and picks the newest match.
+Credentials are loaded from `.env`.
 
-3. Connect to the FTP server and download files.
-   - Logs missing directories or missing files.
-   - Preserves the remote folder structure in `downloads/`.
+Required keys:
 
-4. Clean downloaded files (unless `--skip-clean`).
-   - For every `.xlsx` in `downloads/`, creates a cleaned copy in `cleaned/`.
-   - For `.csv`, converts to `.xlsx`, writes to `cleaned/`, and keeps the original CSV.
-   - Also writes a header-preserving `.xlsx` copy next to the original CSV in `downloads/`.
-   - Removes header rows from all files *except* claims files:
-     - `Standard Bank Legal Claim Amount_Panel_L*.xlsx` keeps headers.
-   - Cleaning rules:
-     - `AccountNumber` -> digits only.
-     - Claims file: clear the `Matter` column.
-     - Handover files: copy `Reference` -> `AccountNumber` before cleaning.
+```env
+FTP_HOST=
+FTP_USER=
+FTP_PASS=
+LEGALSUITE_API_KEY=
+```
 
-5. Optional: Archive closed matters in LegalSuite (`--archive-closed`).
-   - Reads the cleaned closed files:
-     - `cleaned/SBSA/Panel L/Closed_APT_LSW/<Month Year>/*_{date}.xlsx`
-     - `cleaned/SBSA/Debt Review/Debt_Review_Close_APT_LSW/Standard_Bank_Panel_L_Close_{date}_DR.xlsx`
-   - Uses the **downloaded** file (with headers) to find the `File Reference` column.
-   - For each File Reference:
-     - Calls `matter/get` to fetch the matter.
-     - Builds an update payload with all scalar fields + archive fields.
-     - Calls `matter/update` (unless `--archive-dry-run`).
-   - Defaults:
-     - Employee ID = `1`
-     - Archive Status = `2`
-     - Archive Number = pulled from the matter response.
+Use `.env.example` as the template. The real `.env` file is ignored by git.
 
-6. Optional: Update Matter ExtraScreen data (`--update-extrascreen`).
-   - Reads feedback/PTP files from `cleaned/` for the target date.
-   - Reads POC and summons file from `cleaned/SBSA POC AND SUMMONS/` for the target date.
-   - Uses the **downloaded** file (with headers) to locate:
-     - `File Reference`
-     - `Desktop Extra ScreenID`
-   - Maps the columns to `field1..field13` (feedback) or `field1..field29` (PTP).
-   - Maps the POC/Summons columns:
-     - `No. of Call Attempts` -> `field2`
-     - `No of dispatched SMS's` -> `field3`
-     - `No of dispatched Email's` -> `field4`
-     - `No. of Broken PTPs` -> `field5`
-   - Encodes date fields into LegalSuite integer date format.
-     - Accepts Excel-style strings in `YYYY/MM/DD` or `DD/MM/YYYY`.
-     - Strips any time portion (e.g., `2026/04/08 00:00:00`) before encoding.
-   - Calls `matter/get` to find the record ID.
-   - Calls `matdocsc/update` (unless `--extrascreen-dry-run`).
-   - Use `--extrascreen-only feedback|ptp|poc-summons` to limit which extrascreen files run.
+Mail settings for handover report email:
 
-7. Optional: Update claim amounts (`--update-claim-amount`).
-   - Reads claim files from `cleaned/Standard Bank_ClaimsAmount/` for the target date.
-   - Uses `File Reference` and `Claim Amount` columns.
-   - Calls `matter/get` to fetch the matter.
-   - Updates only the `claimamount` field via `matter/update` (unless `--claim-amount-dry-run`).
+```env
+MAIL_MAILER=smtp
+MAIL_HOST=
+MAIL_PORT=2525
+MAIL_USERNAME=
+MAIL_PASSWORD=
+MAIL_ENCRYPTION=tls
+MAIL_FROM_ADDRESS=
+```
 
-8. Write a report log.
-   - Default: `downloads/report_YYYYMMDD.txt`
+The script also accepts the older `SMTP_*` names, but `MAIL_*` is the preferred format.
+
+## Main script
+
+Run the daily script:
+
+```bash
+python3 ftp_download_today.py
+```
+
+By default it:
+
+1. resolves the target date
+2. downloads all expected FTP files for that date
+3. cleans the downloaded files into `cleaned/`
+4. processes handover files unless `--skip-handover` is used
+5. optionally runs extrascreen, claim amount, archive, and reopen updates when those flags are supplied
+6. writes verification workbooks into `verification/` for processed update files
+7. writes a report log to `downloads/report_YYYYMMDD.txt` unless `--log-file` is supplied
+
+## Date selection
+
+- Today:
+  - `python3 ftp_download_today.py`
+- Specific date:
+  - `python3 ftp_download_today.py --date 20260430`
+- Relative date:
+  - `python3 ftp_download_today.py --days-ago 1`
+- Shorthand relative date:
+  - `python3 ftp_download_today.py --days-15`
+
+`--date` overrides `--days-ago`.
+
+## Downloaded file types
+
+The script looks for these source groups:
+
+- Debt Review close
+- Debt Review PTP
+- Debt Review feedback
+- Debt Review reopen
+- Debt Review handover
+- Panel L PTP
+- Panel L feedback
+- Panel L handover
+- Panel L closed
+- Panel L reopen
+- Standard Bank claim amount
+- SBSA POC and summons
+
+It preserves the remote folder structure under `downloads/`.
+
+## Cleaning behavior
+
+Cleaning runs unless `--skip-clean` is supplied.
+
+What cleaning does:
+
+- converts `.csv` files to `.xlsx`
+- writes cleaned files into `cleaned/`
+- strips non-digits from `AccountNumber`
+- clears the `Matter` column in claim amount files
+- for handover files, copies `Reference` into `AccountNumber` before digit cleanup
+- preserves handover headers so handover processing can read the columns correctly
+- removes the first row header from the other cleaned files where required by the older downstream logic
+
+Useful modes:
+
+- reuse existing downloaded files without FTP:
+  - `python3 ftp_download_today.py --clean-only`
+- reuse and skip cleaning:
+  - `python3 ftp_download_today.py --clean-only --skip-clean`
+
+Verification workbook output:
+
+- default folder:
+  - `verification/`
+- override folder:
+  - `python3 ftp_download_today.py --verification-dir audit_verification`
+
+## Handover processing
+
+Handover processing is already integrated into `ftp_download_today.py`.
+
+It runs automatically unless you pass:
+
+```bash
+python3 ftp_download_today.py --skip-handover
+```
+
+What the handover flow does:
+
+1. finds Debt Review and Panel L handover files for the selected date
+2. reads `Client Code` and `Reference`
+3. maps client codes to LegalSuite client IDs
+4. fetches the latest LegalSuite file reference per client code
+5. generates the next file reference
+6. creates the matter
+7. updates the matter description and related fields
+8. creates or reuses the debtor party
+9. creates or reuses the MatParty link
+10. updates Desktop Extra Screen data from the handover row when present
+11. generates an Excel report for newly created matters
+12. emails the handover report with the Excel attached
+
+Handover report columns:
+
+- `Matter File Reference`
+- `Their Reference`
+- `Matter Description`
+
+Live handover report recipients:
+
+- To:
+  - `tnxumalo@straussdaly.co.za`
+  - `areddy@straussdaly.co.za`
+  - `gharris@straussdaly.co.za`
+  - `defbloem@straussdaly.co.za`
+- Cc:
+  - `agashnee.pillay@iconis.co.za`
+  - `thileshnee.chinnasamy@iconis.co.za`
+
+Handover options:
+
+- dry-run only:
+  - `python3 ftp_download_today.py --handover-dry-run`
+- limit rows:
+  - `python3 ftp_download_today.py --handover-create-limit 5`
+- override handover employee ID:
+  - `python3 ftp_download_today.py --handover-logged-in-employee-id 174`
+- test report email mode:
+  - `python3 ftp_download_today.py --handover-email-test`
+
+`--handover-email-test` behavior:
+
+- does not connect to LegalSuite
+- does not check for existing matters
+- does not create matters
+- reads the handover rows directly
+- generates a preview Excel report
+- sends the report to test recipients only
+
+Test recipients:
+
+- To:
+  - `dev@iconis.co.za`
+- Cc:
+  - `boyiajas@gmail.com`
+
+## Matter extrascreen updates
+
+Enable with:
+
+```bash
+python3 ftp_download_today.py --update-extrascreen
+```
+
+What it reads:
+
+- cleaned feedback files
+- cleaned PTP files
+- cleaned POC and summons file
+
+What it does:
+
+- locates `FileRef`
+- locates `Desktop Extra ScreenID`
+- maps source columns to `field1..fieldN`
+- encodes date fields into LegalSuite date integers
+- fetches the matter record ID
+- updates `matdocsc`
+- fetches the extrascreen back
+- compares returned values against the sent payload
+- writes a verification copy of the processed workbook into `verification/`
+- stores the fetched extrascreen row in that verification workbook
+
+Important behavior:
+
+- if there is no extrascreen ID, it skips
+- if there is no extrascreen field data, it skips
+- it only updates and verifies when both screen ID and field data exist
+- if the file contains `PTPCaptureDate`, rows are processed from oldest to newest by that column before updates are sent
+
+Options:
+
+- dry-run:
+  - `python3 ftp_download_today.py --update-extrascreen --extrascreen-dry-run`
+- verbose:
+  - `python3 ftp_download_today.py --update-extrascreen --extrascreen-verbose`
+- limit to one file type:
+  - `python3 ftp_download_today.py --update-extrascreen --extrascreen-only feedback`
+  - `python3 ftp_download_today.py --update-extrascreen --extrascreen-only ptp`
+  - `python3 ftp_download_today.py --update-extrascreen --extrascreen-only poc-summons`
+
+## Claim amount updates
+
+Enable with:
+
+```bash
+python3 ftp_download_today.py --update-claim-amount
+```
+
+What it does:
+
+- reads the cleaned claim file for the selected date
+- finds `FileRef` and `Claim Amount`
+- fetches each matter
+- updates `claimamount`
+- fetches the matter again
+- verifies that the fetched `claimamount` matches the payload
+- writes a verification copy of the processed claim workbook into `verification/`
+- stores the fetched matter data in that verification workbook
+
+Options:
+
+- dry-run:
+  - `python3 ftp_download_today.py --update-claim-amount --claim-amount-dry-run`
+- verbose:
+  - `python3 ftp_download_today.py --update-claim-amount --claim-amount-verbose`
+
+## Archive closed matters
+
+Enable with:
+
+```bash
+python3 ftp_download_today.py --archive-closed
+```
+
+What it does:
+
+- reads the cleaned closed files for the selected date
+- collects `FileRef` values
+- fetches each matter
+- attempts to set the matter to `Archived`
+- includes `actual`, `reserved`, `invested`, `transfer`, and `batchednormal` in the archive payload
+- fetches the matter back to confirm the archive status
+- writes a verification copy of each processed closed workbook into `verification/`
+- stores the fetched archive result in that verification workbook
+
+Archive fallback behavior:
+
+- if LegalSuite returns an error like `You cannot archive a matter...`, the script updates the matter to `Pending Deletion`
+- if LegalSuite accepts the update but the fetched matter still comes back as `Live`, the script also updates the matter to `Pending Deletion`
+- after that fallback it fetches the matter again and prints the final returned archive fields
+
+Options:
+
+- dry-run:
+  - `python3 ftp_download_today.py --archive-closed --archive-dry-run`
+- verbose:
+  - `python3 ftp_download_today.py --archive-closed --archive-verbose`
+- override archive status:
+  - `python3 ftp_download_today.py --archive-closed --archive-status 2`
+
+## Reopen matters
+
+Enable with:
+
+```bash
+python3 ftp_download_today.py --reopen-matters
+```
+
+What it does:
+
+- reads the cleaned reopen files for the selected date
+- collects `Matter Ref` or `FileRef` values
+- fetches each matter
+- updates the matter back to `Live`
+- fetches the matter back again
+- verifies the returned archive/live fields
+- writes a verification copy of each processed reopen workbook into `verification/`
+
+Options:
+
+- dry-run:
+  - `python3 ftp_download_today.py --reopen-matters --reopen-dry-run`
+- verbose:
+  - `python3 ftp_download_today.py --reopen-matters --reopen-verbose`
+
+## Verification system
+
+The script now verifies updates after they are made.
+
+Verification currently exists for:
+
+- handover matter description updates
+- handover desktop extrascreen updates
+- daily extrascreen updates
+- claim amount updates
+- archive updates
+- reopen updates
+- pending deletion fallback updates
+
+Verification pattern:
+
+1. send update payload
+2. fetch the updated LegalSuite record
+3. compare returned fields against the payload
+4. write the fetched verification data into a copied workbook under `verification/`
+5. print either verified fields or mismatch details
+
+Verification workbook behavior for the file-based update flows:
+
+- the script creates a copy of the processed source workbook inside `verification/`
+- it preserves the original workbook content
+- it appends verification columns such as status, notes, timestamp, fetched GET response, and returned field values
+- it writes one verification row back to the matching Excel row that was processed
+
+This keeps the terminal output, but also leaves a saved Excel audit trail of what LegalSuite returned during verification.
 
 ## Common commands
 
-- Download + clean for today:
+- Full daily run:
   - `python3 ftp_download_today.py`
 
-- Download for yesterday:
+- Yesterday’s full daily run:
   - `python3 ftp_download_today.py --days-ago 1`
 
-- Clean only (no FTP):
+- Reuse existing downloads and run the full daily flow:
   - `python3 ftp_download_today.py --clean-only`
-  - Reuses existing selected-date files already in `downloads/`
 
-- Clean only with shorthand date offset:
-  - `python3 ftp_download_today.py --days-28 --clean-only`
+- Full daily run except handover:
+  - `python3 ftp_download_today.py --skip-handover --update-extrascreen --update-claim-amount --archive-closed --reopen-matters`
 
-- Archive closed matters (dry-run):
-  - `python3 ftp_download_today.py --clean-only --archive-closed --archive-dry-run`
+- Full daily run including handover, extrascreen, claims, archive, and reopen:
+  - `python3 ftp_download_today.py --update-extrascreen --update-claim-amount --archive-closed --reopen-matters`
 
-- Archive closed matters (real update):
-  - `python3 ftp_download_today.py --clean-only --archive-closed`
+- Handover only, using existing files, preview mode:
+  - `python3 ftp_download_today.py --clean-only --handover-dry-run --handover-create-limit 1`
 
-- Extrascreen update (dry-run):
-  - `python3 ftp_download_today.py --clean-only --update-extrascreen --extrascreen-dry-run --extrascreen-verbose`
+- Handover email test only, using existing files and no LegalSuite writes:
+  - `python3 ftp_download_today.py --date 20260319 --clean-only --handover-create-limit 1 --handover-dry-run --handover-email-test`
 
-- Extrascreen update (real update):
-  - `python3 ftp_download_today.py --clean-only --update-extrascreen --extrascreen-verbose`
+- Full live daily run including handover creation and live handover report email:
+  - `python3 ftp_download_today.py --update-extrascreen --update-claim-amount --archive-closed --reopen-matters`
 
-- Extrascreen update (POC/Summons only, verbose):
-  - `python3 ftp_download_today.py --clean-only --update-extrascreen --extrascreen-only poc-summons --extrascreen-verbose`
+- Extrascreen only:
+  - `python3 ftp_download_today.py --clean-only --skip-handover --update-extrascreen`
 
-- Claim amount update (dry-run):
-  - `python3 ftp_download_today.py --clean-only --update-claim-amount --claim-amount-dry-run --claim-amount-verbose`
+- Claims only:
+  - `python3 ftp_download_today.py --clean-only --skip-handover --update-claim-amount`
 
-- Claim amount update (real update):
-  - `python3 ftp_download_today.py --clean-only --update-claim-amount --claim-amount-verbose`
+- Archive only:
+  - `python3 ftp_download_today.py --clean-only --skip-handover --archive-closed`
 
-- Run closed + summons + claims + debt review + panel l (using existing downloads):
-  - `python3 ftp_download_today.py --clean-only --update-extrascreen --update-claim-amount --archive-closed`
+- Reopen only:
+  - `python3 ftp_download_today.py --clean-only --skip-handover --reopen-matters`
 
-- Run closed + summons + claims + debt review + panel l (fresh download):
-  - `python3 ftp_download_today.py --update-extrascreen --update-claim-amount --archive-closed`
+## Output and logs
 
-## Handover test script
+Console output shows:
 
-- Standalone handover lookup test:
-  - `python3 handover_file_processing_test.py --date 20260219`
+- files downloaded or missing
+- cleaning stage
+- handover actions
+- extrascreen actions
+- claim updates
+- archive updates
+- reopen updates
+- verification results
+- verification workbook summary
+- handover report generation
+- handover email send status
 
-- Use a date offset instead of a fixed date:
-  - `python3 handover_file_processing_test.py --days-ago 3`
-  - `python3 handover_file_processing_test.py --days-3`
+Report log:
 
-- What it does:
-  - Downloads the handover files from Debt Review and Panel L for the selected date.
-  - Reads the `Client Code` column from the Excel files.
-  - Maps the Excel client code to the LegalSuite `clientid`.
-  - Fetches matching matters from LegalSuite and finds the highest `FileRef` suffix.
-  - Prints the latest matter ref and the next ref that would be used.
+- default path:
+  - `downloads/report_YYYYMMDD.txt`
+- custom path:
+  - `python3 ftp_download_today.py --log-file logs/report.txt`
 
-- Preview matter creation without writing to LegalSuite:
-  - `python3 handover_file_processing_test.py --date 20260219 --clean-only --create-dry-run --create-limit 1`
+## Notes
 
-- Create matters in LegalSuite, then fetch and update changed fields, create debtor party data, and link the debtor to the matter through `matparty/store`:
-  - `python3 handover_file_processing_test.py --date 20260219 --clean-only --create-matters`
-
-- Notes:
-  - It does not create matters, parties, or matparty links in LegalSuite unless `--create-matters` is supplied.
-  - It includes a fallback for the current FTP Debt Review handover folder typo: `Debt_Review_ Handover_APT_LWS`.
+- Missing file means the FTP directory exists but the expected file for that date was not found.
+- Missing directory means the target FTP folder itself was not present.
+- If a source file type is missing, that section is skipped naturally.
+- `--handover-email-test` is the safe way to test the report email path before using the live handover creation flow.
+- `handover_file_processing_test.py` remains useful as a standalone test harness, but the main daily behavior should now be driven through `ftp_download_today.py`.

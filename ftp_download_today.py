@@ -6,15 +6,19 @@ import glob
 import json
 import fnmatch
 import ftplib
+import smtplib
 import os
 import re
 import shutil
 import requests
 import sys
+import time
 import warnings
 import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from email.message import EmailMessage
 from typing import Callable
 
 from env_config import load_env_file
@@ -211,6 +215,29 @@ MATPARTY_DEFAULTS = {
     "reference": "",
 }
 
+HANDOVER_REPORT_TO = [
+    "tnxumalo@straussdaly.co.za",
+    "areddy@straussdaly.co.za",
+    "gharris@straussdaly.co.za",
+    "defbloem@straussdaly.co.za",
+]
+
+HANDOVER_REPORT_CC = [
+    "agashnee.pillay@iconis.co.za",
+    "thileshnee.chinnasamy@iconis.co.za",
+]
+
+HANDOVER_REPORT_TEST_TO = [
+    "dev@iconis.co.za",
+]
+
+HANDOVER_REPORT_TEST_CC = [
+    "boyiajas@gmail.com",
+]
+
+LEGALSUITE_MAX_ATTEMPTS = 3
+LEGALSUITE_RETRY_DELAYS = (2, 5)
+
 XLSX_NS = {
     "a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
 }
@@ -234,6 +261,138 @@ class HandoverRow:
     client_code: str
     client_id: str
     reference: str | None
+
+
+@dataclass(frozen=True)
+class HandoverCreatedMatter:
+    file_ref: str
+    their_reference: str
+    description: str
+
+
+@dataclass
+class VerificationWorkbookState:
+    source_path: str
+    verification_path: str
+    workbook: object
+    header_indexes: dict[str, dict[str, int]]
+
+
+class VerificationWorkbookRecorder:
+    def __init__(self, verification_dir: str, path_roots: list[str]) -> None:
+        self._verification_dir = os.path.abspath(verification_dir)
+        self._path_roots = [os.path.abspath(path) for path in path_roots if path]
+        self._states: dict[str, VerificationWorkbookState] = {}
+
+    def record_row(
+        self,
+        source_path: str,
+        row_number: int,
+        status: str,
+        notes: str,
+        get_response: object | None,
+        verified_values: dict[str, object] | None = None,
+        worksheet_name: str | None = None,
+    ) -> str:
+        state = self._ensure_state(source_path)
+        worksheet = self._resolve_worksheet(state, worksheet_name)
+        values = {
+            "Verification Status": status,
+            "Verification Timestamp": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Verification Notes": notes,
+            "Verification GET Response": self._serialize_response(get_response),
+        }
+        if verified_values:
+            values.update(verified_values)
+
+        for header_name, value in values.items():
+            column_idx = self._ensure_column(state, worksheet.title, header_name)
+            worksheet.cell(row=row_number, column=column_idx).value = value
+
+        return state.verification_path
+
+    def finalize(self) -> list[str]:
+        saved_paths: list[str] = []
+        for source_path, state in list(self._states.items()):
+            state.workbook.save(state.verification_path)
+            state.workbook.close()
+            saved_paths.append(state.verification_path)
+            del self._states[source_path]
+        return sorted(saved_paths)
+
+    def _ensure_state(self, source_path: str) -> VerificationWorkbookState:
+        source_abs = os.path.abspath(source_path)
+        state = self._states.get(source_abs)
+        if state is not None:
+            return state
+
+        verification_path = self._verification_path(source_abs)
+        os.makedirs(os.path.dirname(verification_path), exist_ok=True)
+        shutil.copy2(source_abs, verification_path)
+        workbook = load_workbook(verification_path, read_only=False, data_only=False)
+        state = VerificationWorkbookState(
+            source_path=source_abs,
+            verification_path=verification_path,
+            workbook=workbook,
+            header_indexes={},
+        )
+        self._states[source_abs] = state
+        return state
+
+    def _verification_path(self, source_path: str) -> str:
+        for root in self._path_roots:
+            try:
+                rel_path = os.path.relpath(source_path, root)
+            except ValueError:
+                continue
+            if rel_path == ".":
+                return os.path.join(self._verification_dir, os.path.basename(source_path))
+            if not rel_path.startswith(f"..{os.sep}") and rel_path != "..":
+                return os.path.join(self._verification_dir, rel_path)
+        return os.path.join(self._verification_dir, os.path.basename(source_path))
+
+    @staticmethod
+    def _normalize_header(value: object) -> str:
+        if value is None:
+            return ""
+        return "".join(ch for ch in str(value).strip().lower() if ch.isalnum())
+
+    @staticmethod
+    def _serialize_response(response: object | None) -> str:
+        if response in (None, ""):
+            return ""
+        text = json.dumps(response, default=str, ensure_ascii=True)
+        if len(text) > 32000:
+            return text[:31997] + "..."
+        return text
+
+    @staticmethod
+    def _resolve_worksheet(state: VerificationWorkbookState, worksheet_name: str | None):
+        if worksheet_name and worksheet_name in state.workbook.sheetnames:
+            return state.workbook[worksheet_name]
+        return state.workbook.active
+
+    def _ensure_column(self, state: VerificationWorkbookState, worksheet_name: str, header_name: str) -> int:
+        header_index = state.header_indexes.get(worksheet_name)
+        worksheet = state.workbook[worksheet_name]
+        if header_index is None:
+            header_index = {}
+            max_col = worksheet.max_column or 1
+            for idx in range(1, max_col + 1):
+                key = self._normalize_header(worksheet.cell(row=1, column=idx).value)
+                if key and key not in header_index:
+                    header_index[key] = idx
+            state.header_indexes[worksheet_name] = header_index
+
+        normalized_name = self._normalize_header(header_name)
+        existing_idx = header_index.get(normalized_name)
+        if existing_idx is not None:
+            return existing_idx
+
+        column_idx = (worksheet.max_column or 0) + 1
+        worksheet.cell(row=1, column=column_idx).value = header_name
+        header_index[normalized_name] = column_idx
+        return column_idx
 
 
 class FTPClient:
@@ -345,6 +504,42 @@ class FTPClient:
         return self._ftp
 
 
+def post_with_retry(
+    url: str,
+    headers: dict[str, str],
+    data,
+    timeout: int,
+) -> requests.Response:
+    last_exc: Exception | None = None
+    for attempt in range(1, LEGALSUITE_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.post(url, headers=headers, data=data, timeout=timeout)
+            if response.status_code >= 500:
+                response.raise_for_status()
+            return response
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+            retryable = isinstance(exc, (requests.Timeout, requests.ConnectionError))
+            if isinstance(exc, requests.HTTPError):
+                status_code = exc.response.status_code if exc.response is not None else None
+                retryable = status_code is not None and status_code >= 500
+
+            last_exc = exc
+            if not retryable or attempt >= LEGALSUITE_MAX_ATTEMPTS:
+                raise
+
+            delay = LEGALSUITE_RETRY_DELAYS[min(attempt - 1, len(LEGALSUITE_RETRY_DELAYS) - 1)]
+            print(
+                "LegalSuite request failed "
+                f"(attempt {attempt}/{LEGALSUITE_MAX_ATTEMPTS}): {exc}. "
+                f"Retrying in {delay}s..."
+            )
+            time.sleep(delay)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("LegalSuite request failed without an exception")
+
+
 class LegalSuiteClient:
     def __init__(self, api_base: str, api_key: str) -> None:
         self._api_base = api_base.rstrip("/")
@@ -355,7 +550,7 @@ class LegalSuiteClient:
         data = {
             "where[]": f"Matter.FileRef,=,{file_ref}",
         }
-        resp = requests.post(url, headers=self._headers(), data=data, timeout=60)
+        resp = post_with_retry(url, headers=self._headers(), data=data, timeout=60)
         resp.raise_for_status()
         payload = resp.json()
         items = payload.get("data", [])
@@ -365,7 +560,7 @@ class LegalSuiteClient:
 
     def update_matter(self, payload: dict) -> dict:
         url = f"{self._api_base}/matter/update"
-        resp = requests.post(url, headers=self._headers(), data=payload, timeout=60)
+        resp = post_with_retry(url, headers=self._headers(), data=payload, timeout=60)
         resp.raise_for_status()
         try:
             return resp.json()
@@ -374,12 +569,23 @@ class LegalSuiteClient:
 
     def update_matter_extrascreen(self, payload: dict) -> dict:
         url = f"{self._api_base}/matdocsc/update"
-        resp = requests.post(url, headers=self._headers(), data=payload, timeout=60)
+        resp = post_with_retry(url, headers=self._headers(), data=payload, timeout=60)
         resp.raise_for_status()
         try:
             return resp.json()
         except ValueError:
             return {"raw_response": resp.text}
+
+    def get_matter_extrascreen(self, matter_id: int | str, docscreenid: int | str) -> list[dict]:
+        url = f"{self._api_base}/matdocsc/get"
+        data = [
+            ("where[]", f"MatDocSc.MatterID,=,{matter_id}"),
+            ("where[]", f"MatDocSc.DocScreenID,=,{docscreenid}"),
+        ]
+        resp = post_with_retry(url, headers=self._headers(), data=data, timeout=60)
+        resp.raise_for_status()
+        payload = resp.json()
+        return payload.get("data", [])
 
     @staticmethod
     def build_archive_payload(
@@ -403,11 +609,68 @@ class LegalSuiteClient:
                 "formattedupdatedbytime": now.strftime("%H:%M:%S"),
             }
         )
+        for field_name in ("actual", "reserved", "invested", "transfer", "batchednormal"):
+            payload[field_name] = matter.get(field_name)
         if archive_status is not None:
             payload["archivestatus"] = str(archive_status)
         if archive_no is not None:
             payload["archiveno"] = str(archive_no)
         return {k: v for k, v in payload.items() if v not in ("", None)}
+
+    @staticmethod
+    def build_pending_deletion_payload(
+        matter: dict,
+        logged_in_employee_id: str,
+        archive_no: str | None = None,
+    ) -> dict:
+        now = dt.datetime.now()
+        payload = {}
+        for key, value in matter.items():
+            if isinstance(value, (dict, list, tuple, set)):
+                continue
+            payload[key] = value
+        payload.update(
+            {
+                "loggedinemployeeid": str(logged_in_employee_id),
+                "archiveflag": "0",
+                "archivestatus": "1",
+                "archivestatusdescription": "Pending Deletion",
+                "formattedupdatedbydate": now.strftime("%d %b %Y"),
+                "formattedupdatedbytime": now.strftime("%H:%M:%S"),
+            }
+        )
+        if archive_no is not None:
+            payload["archiveno"] = str(archive_no)
+        return {k: v for k, v in payload.items() if v not in ("", None)}
+
+    @staticmethod
+    def build_reopen_payload(
+        matter: dict,
+        logged_in_employee_id: str,
+    ) -> dict:
+        now = dt.datetime.now()
+        payload = {}
+        for key, value in matter.items():
+            if isinstance(value, (dict, list, tuple, set)):
+                continue
+            payload[key] = value
+        payload.update(
+            {
+                "loggedinemployeeid": str(logged_in_employee_id),
+                "archiveflag": "0",
+                "archivestatus": "0",
+                "archiveno": "0",
+                "archivestatusdescription": "Live",
+                "archivedate": "",
+                "formattedupdatedbydate": now.strftime("%d %b %Y"),
+                "formattedupdatedbytime": now.strftime("%H:%M:%S"),
+            }
+        )
+        return {
+            key: value
+            for key, value in payload.items()
+            if value is not None and (value != "" or key == "archivedate")
+        }
 
     @staticmethod
     def build_claim_amount_payload(
@@ -424,11 +687,52 @@ class LegalSuiteClient:
         payload["claimamount"] = claim_amount
         return {k: v for k, v in payload.items() if v not in ("", None)}
 
+    @staticmethod
+    def build_claim_amount_fileref_only_payload(
+        matter: dict,
+        file_ref: str,
+        logged_in_employee_id: str,
+        claim_amount: object,
+    ) -> dict:
+        payload = {}
+        for key, value in matter.items():
+            if key == "oldcode" or isinstance(value, (dict, list, tuple, set)):
+                continue
+            payload[key] = value
+        payload["fileref"] = file_ref
+        payload["loggedinemployeeid"] = str(logged_in_employee_id)
+        payload["claimamount"] = claim_amount
+        return {k: v for k, v in payload.items() if v not in ("", None)}
+
     def _headers(self) -> dict:
         return {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/x-www-form-urlencoded",
         }
+
+
+def extract_update_error_text(result: dict | str) -> str:
+    if isinstance(result, dict):
+        errors = result.get("errors")
+        if errors:
+            return str(errors)
+        raw_response = result.get("raw_response")
+        if raw_response:
+            return str(raw_response)
+    return str(result or "")
+
+
+def is_archive_rejected_error(result: dict | str) -> bool:
+    error_text = extract_update_error_text(result).lower()
+    return (
+        "you cannot archive a matter" in error_text
+        or "you cannot archieve a matter" in error_text
+    )
+
+
+def is_old_code_unique_error(result: dict | str) -> bool:
+    error_text = extract_update_error_text(result).lower()
+    return "already has this old code" in error_text and "old code must be unique" in error_text
 
 
 class LegalSuiteLookupClient:
@@ -442,7 +746,7 @@ class LegalSuiteLookupClient:
             ("where[]", f"Matter.ClientID,=,{client_id}"),
             ("where[]", f"Matter.FileRef,like,{prefix}/%"),
         ]
-        response = requests.post(url, headers=self._headers(), data=data, timeout=120)
+        response = post_with_retry(url, headers=self._headers(), data=data, timeout=120)
         response.raise_for_status()
         payload = response.json()
         return payload.get("data", [])
@@ -452,7 +756,7 @@ class LegalSuiteLookupClient:
         data = {
             "where[]": f"Matter.FileRef,=,{file_ref}",
         }
-        response = requests.post(url, headers=self._headers(), data=data, timeout=60)
+        response = post_with_retry(url, headers=self._headers(), data=data, timeout=60)
         response.raise_for_status()
         payload = response.json()
         return payload.get("data", [])
@@ -463,7 +767,7 @@ class LegalSuiteLookupClient:
             ("where[]", f"Matter.ClientID,=,{client_id}"),
             ("where[]", f"Matter.TheirRef,=,{reference}"),
         ]
-        response = requests.post(url, headers=self._headers(), data=data, timeout=60)
+        response = post_with_retry(url, headers=self._headers(), data=data, timeout=60)
         response.raise_for_status()
         payload = response.json()
         return payload.get("data", [])
@@ -471,7 +775,7 @@ class LegalSuiteLookupClient:
     def create_matter(self, data: dict) -> dict | str:
         url = f"{self._api_base}/matter/store"
         payload = {key: str(value) for key, value in data.items()}
-        response = requests.post(url, headers=self._headers(), data=payload, timeout=60)
+        response = post_with_retry(url, headers=self._headers(), data=payload, timeout=60)
         response.raise_for_status()
         try:
             return response.json()
@@ -483,7 +787,7 @@ class LegalSuiteLookupClient:
         data = {
             "where[]": f"Matter.RecordID,=,{recordid}",
         }
-        response = requests.post(url, headers=self._headers(), data=data, timeout=60)
+        response = post_with_retry(url, headers=self._headers(), data=data, timeout=60)
         response.raise_for_status()
         try:
             return response.json()
@@ -497,7 +801,7 @@ class LegalSuiteLookupClient:
         }
         for key, value in updates.items():
             payload[key] = str(value)
-        response = requests.post(url, headers=self._headers(), data=payload, timeout=60)
+        response = post_with_retry(url, headers=self._headers(), data=payload, timeout=60)
         response.raise_for_status()
         try:
             return response.json()
@@ -507,7 +811,7 @@ class LegalSuiteLookupClient:
     def create_party(self, data: dict) -> dict | str:
         url = f"{self._api_base}/party/store"
         payload = {key: str(value) for key, value in data.items()}
-        response = requests.post(url, headers=self._headers(), data=payload, timeout=60)
+        response = post_with_retry(url, headers=self._headers(), data=payload, timeout=60)
         response.raise_for_status()
         try:
             return response.json()
@@ -519,7 +823,7 @@ class LegalSuiteLookupClient:
         data = {
             "where[]": f"Party.IdentityNumber,=,{identity_number}",
         }
-        response = requests.post(url, headers=self._headers(), data=data, timeout=60)
+        response = post_with_retry(url, headers=self._headers(), data=data, timeout=60)
         response.raise_for_status()
         payload = response.json()
         return payload.get("data", [])
@@ -530,7 +834,7 @@ class LegalSuiteLookupClient:
             ("where[]", f"MatParty.MatterID,=,{matter_id}"),
             ("where[]", f"MatParty.PartyID,=,{party_id}"),
         ]
-        response = requests.post(url, headers=self._headers(), data=data, timeout=60)
+        response = post_with_retry(url, headers=self._headers(), data=data, timeout=60)
         response.raise_for_status()
         payload = response.json()
         return payload.get("data", [])
@@ -538,7 +842,7 @@ class LegalSuiteLookupClient:
     def create_matparty(self, data: dict) -> dict | str:
         url = f"{self._api_base}/matparty/store"
         payload = {key: str(value) for key, value in data.items()}
-        response = requests.post(url, headers=self._headers(), data=payload, timeout=60)
+        response = post_with_retry(url, headers=self._headers(), data=payload, timeout=60)
         response.raise_for_status()
         try:
             return response.json()
@@ -548,7 +852,7 @@ class LegalSuiteLookupClient:
     def update_matter_extrascreen(self, data: dict) -> dict | str:
         url = f"{self._api_base}/matdocsc/update"
         payload = {key: str(value) for key, value in data.items()}
-        response = requests.post(url, headers=self._headers(), data=payload, timeout=60)
+        response = post_with_retry(url, headers=self._headers(), data=payload, timeout=60)
         response.raise_for_status()
         try:
             return response.json()
@@ -561,7 +865,7 @@ class LegalSuiteLookupClient:
             ("where[]", f"MatDocSc.MatterID,=,{matter_id}"),
             ("where[]", f"MatDocSc.DocScreenID,=,{docscreenid}"),
         ]
-        response = requests.post(url, headers=self._headers(), data=data, timeout=60)
+        response = post_with_retry(url, headers=self._headers(), data=data, timeout=60)
         response.raise_for_status()
         payload = response.json()
         return payload.get("data", [])
@@ -1203,7 +1507,36 @@ def fetch_matter_row(client: LegalSuiteLookupClient, recordid: int | str) -> dic
 def normalize_compare_value(value: object) -> str:
     if value is None:
         return ""
-    return str(value).strip()
+    if isinstance(value, bool):
+        return str(value).strip()
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            return format(Decimal(str(value)).normalize(), "f").rstrip("0").rstrip(".") or "0"
+        except (InvalidOperation, ValueError):
+            return str(value).strip()
+
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    numeric_text = text.replace(",", "")
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", numeric_text):
+        try:
+            return format(Decimal(numeric_text).normalize(), "f").rstrip("0").rstrip(".") or "0"
+        except InvalidOperation:
+            pass
+
+    return text
+
+
+MATTER_VERIFY_IGNORE_FIELDS = {
+    "formattedupdatedbydate",
+    "formattedupdatedbytime",
+    "updatedbydate",
+    "updatedbytime",
+    "updatedbydatetime",
+    "loggedinemployeeid",
+}
 
 
 def find_changed_fields(before: dict, after: dict, field_names: list[str]) -> list[tuple[str, object, object]]:
@@ -1234,6 +1567,48 @@ def describe_extrascreen_field_values(row: dict, field_names: list[str]) -> str:
         if normalize_compare_value(value):
             parts.append(f"{field_name}={value}")
     return ", ".join(parts) if parts else "<all blank>"
+
+
+def compare_matter_payload_to_row(
+    payload: dict[str, object],
+    fetched_row: dict,
+    field_names: list[str] | None = None,
+    ignore_fields: set[str] | None = None,
+) -> list[tuple[str, object, object]]:
+    ignored = set(MATTER_VERIFY_IGNORE_FIELDS)
+    if ignore_fields:
+        ignored.update(ignore_fields)
+
+    names = field_names or sorted(payload)
+    mismatches: list[tuple[str, object, object]] = []
+    for field_name in names:
+        if field_name in ignored:
+            continue
+        sent_value = payload.get(field_name)
+        fetched_value = fetched_row.get(field_name)
+        if normalize_compare_value(sent_value) != normalize_compare_value(fetched_value):
+            mismatches.append((field_name, sent_value, fetched_value))
+    return mismatches
+
+
+def print_matter_verification(
+    label: str,
+    payload: dict[str, object],
+    fetched_row: dict,
+    field_names: list[str] | None = None,
+    ignore_fields: set[str] | None = None,
+) -> None:
+    mismatches = compare_matter_payload_to_row(payload, fetched_row, field_names=field_names, ignore_fields=ignore_fields)
+    names = [name for name in (field_names or sorted(payload)) if name not in MATTER_VERIFY_IGNORE_FIELDS]
+    if mismatches:
+        mismatch_names = ", ".join(field_name for field_name, _, _ in mismatches)
+        print(f"  {label} verification mismatches: {mismatch_names}")
+        for field_name, sent_value, fetched_value in mismatches:
+            print(f"    {field_name}: sent={sent_value!r} fetched={fetched_value!r}")
+    elif names:
+        print(f"  {label} verified: {', '.join(names)}")
+    else:
+        print(f"  {label} had no fields to verify.")
 
 
 def find_existing_matter_for_row(client: LegalSuiteLookupClient, row: HandoverRow, file_ref: str) -> dict | None:
@@ -1303,13 +1678,14 @@ def create_and_update_handover_matters(
     logged_in_employee_id: str,
     create_matters: bool,
     create_limit: int | None,
-) -> None:
+) -> list[HandoverCreatedMatter]:
     next_numbers: dict[str, tuple[int, int]] = {
         code: next_ref_sequence_start(next_ref)
         for code, next_ref in next_refs_by_code.items()
     }
 
     processed_count = 0
+    created_matters: list[HandoverCreatedMatter] = []
     print("\nMatter create/update:")
     for row in rows:
         if create_limit is not None and processed_count >= create_limit:
@@ -1356,6 +1732,13 @@ def create_and_update_handover_matters(
             print(f"  Matter created; recovered recordid from create error: {recordid}")
         else:
             print(f"  Created matter recordid: {recordid}")
+        created_matters.append(
+            HandoverCreatedMatter(
+                file_ref=file_ref,
+                their_reference=str(payload.get("theirref") or row.reference or ""),
+                description=str(payload.get("description") or ""),
+            )
+        )
         matter_after_create = fetch_matter_row(client, recordid)
         print(f"  Matter claimamount after create: {matter_after_create.get('claimamount')}")
 
@@ -1364,6 +1747,12 @@ def create_and_update_handover_matters(
         client.update_matter(recordid, update_payload)
         print("  Updated matter description")
         matter_after_update = fetch_matter_row(client, recordid)
+        print_matter_verification(
+            "Matter description update",
+            update_payload,
+            matter_after_update,
+            field_names=sorted(update_payload),
+        )
         print(f"  Matter claimamount after description update: {matter_after_update.get('claimamount')}")
         tracked_fields = sorted(
             set(payload) | {"claimamount", "debtorsbalance", "debtorsopeningbalance", "interestonamount", "debtorscapitalbalance"}
@@ -1414,6 +1803,8 @@ def create_and_update_handover_matters(
 
         update_handover_row_desktop_extrascreens(client, row, recordid, dry_run=False)
 
+    return created_matters
+
 
 def process_handover_files(
     paths: list[str],
@@ -1424,7 +1815,7 @@ def process_handover_files(
     create_dry_run: bool,
     create_limit: int | None,
     logged_in_employee_id: str,
-) -> int:
+) -> list[HandoverCreatedMatter]:
     code_counts: dict[str, int] = {}
     unknown_codes: list[str] = []
     code_references: dict[str, list[str]] = {}
@@ -1446,7 +1837,7 @@ def process_handover_files(
 
     if not code_counts:
         print("No Client Code values found in the downloaded handover files.")
-        return 0
+        return []
 
     if unknown_codes:
         print("Unknown client codes in Excel:", ", ".join(sorted(unknown_codes)))
@@ -1483,7 +1874,7 @@ def process_handover_files(
                 unknown_codes.append(code)
         if unknown_codes:
             print("Rows skipped for unknown client codes:", ", ".join(sorted(unknown_codes)))
-        create_and_update_handover_matters(
+        return create_and_update_handover_matters(
             rows=rows,
             next_refs_by_code=next_refs_by_code,
             client=client,
@@ -1493,7 +1884,25 @@ def process_handover_files(
             create_limit=create_limit,
         )
 
-    return 0
+    return []
+
+
+def build_handover_report_preview_entries(
+    rows: list[HandoverRow],
+    create_limit: int | None,
+) -> list[HandoverCreatedMatter]:
+    preview_entries: list[HandoverCreatedMatter] = []
+    for row in rows:
+        if create_limit is not None and len(preview_entries) >= create_limit:
+            break
+        preview_entries.append(
+            HandoverCreatedMatter(
+                file_ref=f"{row.client_code}/TEST-{row.row_number:04d}",
+                their_reference=str(row.reference or ""),
+                description=build_description(row),
+            )
+        )
+    return preview_entries
 
 
 class Cleaner:
@@ -1754,56 +2163,90 @@ class App:
         self._date_ctx = self._resolve_date(args.date, args.days_ago)
         self._targets = self._build_targets(self._date_ctx)
         self._cleaner = Cleaner(HANDOVER_PREFIXES)
+        self._verification_recorder = VerificationWorkbookRecorder(
+            self._args.verification_dir,
+            [self._args.cleaned_dir, self._args.download_dir],
+        )
 
     def run(self) -> int:
         report_lines = [
             f"Report date: {self._date_ctx.date_str}",
             f"Month folder: {self._date_ctx.month_year}",
         ]
+        return_code = 0
+        try:
+            download_counts, source_paths = self._download_files(report_lines)
+            if download_counts is None:
+                return_code = 1
+                return return_code
 
-        download_counts, source_paths = self._download_files(report_lines)
-        if download_counts is None:
-            self._write_report(report_lines)
-            return 1
+            if not self._args.skip_clean:
+                print("Cleaning downloaded files...")
+                self._cleaner.clean_downloads(
+                    self._args.download_dir,
+                    self._args.cleaned_dir,
+                    report_lines,
+                    source_paths=source_paths,
+                )
 
-        if not self._args.skip_clean:
-            print("Cleaning downloaded files...")
-            self._cleaner.clean_downloads(
-                self._args.download_dir,
-                self._args.cleaned_dir,
-                report_lines,
-                source_paths=source_paths,
+            if not self._args.skip_handover:
+                print("Processing handover files...")
+                self._process_handover(report_lines)
+
+            if self._args.update_extrascreen:
+                print("Updating matter extra screens...")
+                self._update_matter_extrascreens(report_lines)
+
+            if self._args.update_claim_amount:
+                print("Updating claim amounts...")
+                self._update_claim_amounts(report_lines)
+
+            if self._args.archive_closed:
+                print("Reading closed files and calling LegalSuite...")
+                self._archive_closed_matters(report_lines)
+
+            if self._args.reopen_matters:
+                print("Reading reopen files and calling LegalSuite...")
+                self._reopen_matters(report_lines)
+
+            report_lines.append(
+                "Summary: downloaded={downloaded}, reused={reused}, missing_dirs={missing_dirs}, "
+                "missing_files={missing_files}, failed_downloads={failed}".format(
+                    downloaded=download_counts["downloaded"],
+                    reused=download_counts["reused"],
+                    missing_dirs=download_counts["missing_dirs"],
+                    missing_files=download_counts["missing_files"],
+                    failed=download_counts["failed_downloads"],
+                )
             )
+            return return_code
+        finally:
+            self._finalize_verification_workbooks(report_lines)
+            self._write_report(report_lines)
 
-        if not self._args.skip_handover:
-            print("Processing handover files...")
-            self._process_handover(report_lines)
+    def _finalize_verification_workbooks(self, report_lines: list[str]) -> None:
+        try:
+            verification_paths = self._verification_recorder.finalize()
+        except Exception as exc:
+            report_lines.append(f"Verification workbook save failed: {exc}")
+            print(f"Verification workbook save failed: {exc}", file=sys.stderr)
+            return
 
-        if self._args.update_extrascreen:
-            print("Updating matter extra screens...")
-            self._update_matter_extrascreens(report_lines)
-
-        if self._args.update_claim_amount:
-            print("Updating claim amounts...")
-            self._update_claim_amounts(report_lines)
-
-        if self._args.archive_closed:
-            print("Reading closed files and calling LegalSuite...")
-            self._archive_closed_matters(report_lines)
+        if not verification_paths:
+            return
 
         report_lines.append(
-            "Summary: downloaded={downloaded}, reused={reused}, missing_dirs={missing_dirs}, "
-            "missing_files={missing_files}, failed_downloads={failed}".format(
-                downloaded=download_counts["downloaded"],
-                reused=download_counts["reused"],
-                missing_dirs=download_counts["missing_dirs"],
-                missing_files=download_counts["missing_files"],
-                failed=download_counts["failed_downloads"],
+            "Verification workbook summary: created={count}, directory={directory}".format(
+                count=len(verification_paths),
+                directory=os.path.abspath(self._args.verification_dir),
             )
         )
-
-        self._write_report(report_lines)
-        return 0
+        print(
+            "Verification workbook summary: created={count}, directory={directory}".format(
+                count=len(verification_paths),
+                directory=os.path.abspath(self._args.verification_dir),
+            )
+        )
 
     def _download_files(self, report_lines: list[str]) -> tuple[dict[str, int] | None, list[str]]:
         counts = {
@@ -1992,12 +2435,6 @@ class App:
         return resolved_files
 
     def _process_handover(self, report_lines: list[str]) -> None:
-        api_key = self._args.api_key or os.getenv("LEGALSUITE_API_KEY") or LEGALSUITE_API_KEY
-        if not api_key:
-            report_lines.append("Handover processing skipped: missing API key.")
-            print("Handover processing skipped: missing API key.", file=sys.stderr)
-            return
-
         if self._args.skip_clean:
             working_files = self._resolve_handover_files(self._args.download_dir, "downloaded")
         else:
@@ -2011,7 +2448,36 @@ class App:
             print("No handover files were available.")
             return
 
-        process_handover_files(
+        if self._args.handover_email_test:
+            print("Handover email test mode: generating report from handover rows only.")
+            preview_rows, row_unknown_codes = read_handover_rows(working_files)
+            if row_unknown_codes:
+                report_lines.append(
+                    "Handover email test skipped unknown client codes: {codes}".format(
+                        codes=", ".join(sorted(row_unknown_codes))
+                    )
+                )
+            preview_entries = build_handover_report_preview_entries(
+                preview_rows,
+                self._args.handover_create_limit,
+            )
+            if not preview_entries:
+                report_lines.append("Handover email test skipped: no handover rows available for report.")
+                print("No handover rows were available for the email test report.")
+                return
+            report_path = self._write_handover_report(preview_entries)
+            report_lines.append(f"Handover test report generated: {report_path}")
+            print(f"Handover test report generated: {report_path}")
+            self._send_handover_report_email(report_path, preview_entries, report_lines)
+            return
+
+        api_key = self._args.api_key or os.getenv("LEGALSUITE_API_KEY") or LEGALSUITE_API_KEY
+        if not api_key:
+            report_lines.append("Handover processing skipped: missing API key.")
+            print("Handover processing skipped: missing API key.", file=sys.stderr)
+            return
+
+        created_matters = process_handover_files(
             paths=working_files,
             api_base=self._args.api_base,
             api_key=api_key,
@@ -2023,6 +2489,119 @@ class App:
         )
         report_lines.append(
             "Handover processing completed for {count} file(s).".format(count=len(working_files))
+        )
+        if self._args.handover_dry_run:
+            report_lines.append("Handover email skipped: dry-run mode.")
+            return
+        if not created_matters:
+            report_lines.append("Handover email skipped: no new matters were created.")
+            print("No new handover matters were created; report email skipped.")
+            return
+
+        report_path = self._write_handover_report(created_matters)
+        report_lines.append(f"Handover report generated: {report_path}")
+        print(f"Handover report generated: {report_path}")
+        self._send_handover_report_email(report_path, created_matters, report_lines)
+
+    def _write_handover_report(self, created_matters: list[HandoverCreatedMatter]) -> str:
+        if Workbook is None:
+            raise RuntimeError("openpyxl is not installed")
+
+        report_dir = os.path.join(self._args.download_dir, "handover_reports")
+        os.makedirs(report_dir, exist_ok=True)
+        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = os.path.join(report_dir, f"handover_created_matters_{self._date_ctx.date_str}_{timestamp}.xlsx")
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Handover Report"
+        worksheet.append(
+            [
+                "Matter File Reference",
+                "Their Reference",
+                "Matter Description",
+            ]
+        )
+        for item in created_matters:
+            worksheet.append([item.file_ref, item.their_reference, item.description])
+        workbook.save(report_path)
+        workbook.close()
+        return report_path
+
+    def _send_handover_report_email(
+        self,
+        report_path: str,
+        created_matters: list[HandoverCreatedMatter],
+        report_lines: list[str],
+    ) -> None:
+        smtp_host = os.getenv("MAIL_HOST", os.getenv("SMTP_HOST", "")).strip()
+        smtp_port = int(os.getenv("MAIL_PORT", os.getenv("SMTP_PORT", "587")).strip() or "587")
+        smtp_user = os.getenv("MAIL_USERNAME", os.getenv("SMTP_USER", "")).strip()
+        smtp_pass = os.getenv("MAIL_PASSWORD", os.getenv("SMTP_PASS", "")).strip()
+        smtp_from = os.getenv("MAIL_FROM_ADDRESS", os.getenv("SMTP_FROM", smtp_user)).strip()
+        encryption = os.getenv("MAIL_ENCRYPTION", "").strip().lower()
+        smtp_use_tls = encryption not in {"", "null", "none", "false", "0", "no"} if "MAIL_ENCRYPTION" in os.environ else (
+            os.getenv("SMTP_USE_TLS", "true").strip().lower() not in {"0", "false", "no"}
+        )
+
+        missing = [name for name, value in (("SMTP_HOST", smtp_host), ("SMTP_FROM", smtp_from)) if not value]
+        if missing:
+            message = f"Handover email skipped: missing SMTP settings: {', '.join(missing)}"
+            report_lines.append(message)
+            print(message)
+            return
+
+        to_recipients = HANDOVER_REPORT_TEST_TO if self._args.handover_email_test else HANDOVER_REPORT_TO
+        cc_recipients = HANDOVER_REPORT_TEST_CC if self._args.handover_email_test else HANDOVER_REPORT_CC
+        subject_prefix = "[TEST] " if self._args.handover_email_test else ""
+
+        message = EmailMessage()
+        message["Subject"] = f"{subject_prefix}Handover Matter Creation Report - {self._date_ctx.date_str}"
+        message["From"] = smtp_from
+        message["To"] = ", ".join(to_recipients)
+        if cc_recipients:
+            message["Cc"] = ", ".join(cc_recipients)
+        message.set_content(
+            "Good Day All,\n\n"
+            "I trust you are well.\n\n"
+            "Please find attached the references for the new matters that have been imported over into legal suite.\n\n"
+            "Kind Regards,\n"
+        )
+
+        with open(report_path, "rb") as handle:
+            message.add_attachment(
+                handle.read(),
+                maintype="application",
+                subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                filename=os.path.basename(report_path),
+            )
+
+        all_recipients = to_recipients + cc_recipients
+        try:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as server:
+                if smtp_use_tls:
+                    server.starttls()
+                if smtp_user:
+                    server.login(smtp_user, smtp_pass)
+                server.send_message(message, from_addr=smtp_from, to_addrs=all_recipients)
+        except Exception as exc:
+            report_lines.append(f"Handover email failed: {exc}")
+            print(f"Handover email failed: {exc}", file=sys.stderr)
+            return
+
+        report_lines.append(
+            "Handover email sent: to={to_count}, cc={cc_count}, test_mode={test_mode}".format(
+                to_count=len(to_recipients),
+                cc_count=len(cc_recipients),
+                test_mode=self._args.handover_email_test,
+            )
+        )
+        print(
+            "Handover email sent: to={to_count}, cc={cc_count}, test_mode={test_mode}".format(
+                to_count=len(to_recipients),
+                cc_count=len(cc_recipients),
+                test_mode=self._args.handover_email_test,
+            )
         )
 
     def _update_matter_extrascreens(self, report_lines: list[str]) -> None:
@@ -2060,6 +2639,7 @@ class App:
                 label = self._extrascreen_mapping_label(mapping)
                 print(f"Extrascreen file ({label}): {cleaned_path}")
             download_path = self._download_path_for_cleaned(cleaned_path)
+            verification_source_path = download_path if os.path.exists(download_path) else cleaned_path
             header_row = self._read_header_row(download_path)
             if not header_row:
                 report_lines.append(f"Header not found for extrascreen update: {cleaned_path}")
@@ -2071,43 +2651,127 @@ class App:
                 continue
 
             workbook = load_workbook(cleaned_path, read_only=False, data_only=True)
-            for worksheet in workbook.worksheets:
-                max_col = worksheet.max_column or max(col_map.values(), default=0)
-                for row in worksheet.iter_rows(min_row=1, max_col=max_col, values_only=True):
-                    file_ref = self._cell_text(row, file_ref_idx)
-                    docscreenid = self._cell_text(row, screen_id_idx)
-                    if not file_ref or not docscreenid:
-                        continue
-                    payload = self._build_extrascreen_payload(row, col_map, mapping)
-                    if not payload:
-                        continue
-                    try:
-                        matter = client.get_matter_by_fileref(file_ref)
-                        recordid = matter.get("recordid")
-                        if not recordid:
-                            report_lines.append(f"Extrascreen update skipped (missing recordid): {file_ref}")
+            try:
+                for worksheet in workbook.worksheets:
+                    max_col = worksheet.max_column or max(col_map.values(), default=0)
+                    header_row_values = tuple(header_row)
+                    data_start_row = self._worksheet_data_start_row(worksheet, file_ref_idx)
+                    verification_row_offset = 1 if verification_source_path != cleaned_path and data_start_row == 1 else 0
+                    processing_rows = self._iter_processing_rows(
+                        worksheet,
+                        max_col=max_col,
+                        data_start_row=data_start_row,
+                        header_row=header_row,
+                    )
+                    if self._args.extrascreen_verbose and self._find_header_index(header_row, {"ptpcapturedate"}):
+                        print(
+                            "  Sorting worksheet rows by PTPCaptureDate ascending before processing: "
+                            f"{worksheet.title}"
+                        )
+                    for row_number, row in processing_rows:
+                        verification_row_number = row_number + verification_row_offset
+                        file_ref = self._cell_text(row, file_ref_idx)
+                        docscreenid = self._cell_text(row, screen_id_idx)
+                        if not file_ref or not docscreenid:
                             continue
-                        payload["matterid"] = recordid
-                        payload["docscreenid"] = docscreenid
-                        processed += 1
-                        if self._args.extrascreen_dry_run:
-                            print(f"Extrascreen dry-run: {file_ref} -> docscreenid={docscreenid}")
+                        field_payload = self._build_extrascreen_payload(row, col_map, mapping)
+                        if not field_payload:
+                            continue
+                        try:
+                            matter = client.get_matter_by_fileref(file_ref)
+                            recordid = matter.get("recordid")
+                            if not recordid:
+                                report_lines.append(f"Extrascreen update skipped (missing recordid): {file_ref}")
+                                self._record_verification_result(
+                                    verification_source_path,
+                                    worksheet.title,
+                                    verification_row_number,
+                                    "Skipped",
+                                    "Missing recordid on fetched matter.",
+                                    matter,
+                                )
+                                continue
+                            payload = {
+                                "matterid": recordid,
+                                "docscreenid": docscreenid,
+                                **field_payload,
+                            }
+                            processed += 1
+                            if self._args.extrascreen_dry_run:
+                                print(f"Extrascreen dry-run: {file_ref} -> docscreenid={docscreenid}")
+                                if self._args.extrascreen_verbose:
+                                    print(json.dumps(payload, indent=2, default=str))
+                                continue
                             if self._args.extrascreen_verbose:
+                                print(f"Extrascreen update payload for {file_ref}:")
                                 print(json.dumps(payload, indent=2, default=str))
-                            continue
-                        if self._args.extrascreen_verbose:
-                            print(f"Extrascreen update payload for {file_ref}:")
-                            print(json.dumps(payload, indent=2, default=str))
-                        result = client.update_matter_extrascreen(payload)
-                        if self._args.extrascreen_verbose:
-                            print(f"Extrascreen update response for {file_ref}:")
-                            print(json.dumps(result, indent=2, default=str))
-                        print(f"Extrascreen updated: {file_ref} -> docscreenid={docscreenid}")
-                        updated += 1
-                    except Exception as exc:
-                        failed += 1
-                        report_lines.append(f"Extrascreen update failed for {file_ref}: {exc}")
-                        print(f"Extrascreen update failed for {file_ref}: {exc}", file=sys.stderr)
+                            result = client.update_matter_extrascreen(payload)
+                            if self._args.extrascreen_verbose:
+                                print(f"Extrascreen update response for {file_ref}:")
+                                print(json.dumps(result, indent=2, default=str))
+                            print(f"Extrascreen updated: {file_ref} -> docscreenid={docscreenid}")
+                            fetched_rows = client.get_matter_extrascreen(recordid, docscreenid)
+                            verification_status = "Verified"
+                            verification_notes = ""
+                            verification_response: object = fetched_rows
+                            verification_values: dict[str, object] | None = None
+                            if not fetched_rows:
+                                verification_status = "Missing GET data"
+                                verification_notes = "No extrascreen data returned after update."
+                                print(
+                                    f"  Extrascreen verification failed: no data returned for {file_ref} -> "
+                                    f"docscreenid={docscreenid}"
+                                )
+                            else:
+                                fetched_row = fetched_rows[0]
+                                verification_response = fetched_row
+                                verification_values = self._build_extrascreen_verification_values(
+                                    header_row_values,
+                                    col_map,
+                                    mapping,
+                                    fetched_row,
+                                )
+                                mismatches = compare_extrascreen_payload_to_row(field_payload, fetched_row)
+                                if mismatches:
+                                    mismatch_names = ", ".join(field_name for field_name, _, _ in mismatches)
+                                    verification_status = "Mismatch"
+                                    verification_notes = f"Mismatched fields: {mismatch_names}"
+                                    print(
+                                        f"  Extrascreen verification mismatches for {file_ref} -> "
+                                        f"docscreenid={docscreenid}: {mismatch_names}"
+                                    )
+                                    for field_name, sent_value, fetched_value in mismatches:
+                                        print(f"    {field_name}: sent={sent_value!r} fetched={fetched_value!r}")
+                                else:
+                                    verified_fields = sorted(key for key in field_payload if key.startswith("field"))
+                                    print(
+                                        f"  Extrascreen verified for {file_ref} -> docscreenid={docscreenid}: "
+                                        f"{', '.join(verified_fields)}"
+                                    )
+                            self._record_verification_result(
+                                verification_source_path,
+                                worksheet.title,
+                                verification_row_number,
+                                verification_status,
+                                verification_notes,
+                                verification_response,
+                                verification_values,
+                            )
+                            updated += 1
+                        except Exception as exc:
+                            failed += 1
+                            report_lines.append(f"Extrascreen update failed for {file_ref}: {exc}")
+                            print(f"Extrascreen update failed for {file_ref}: {exc}", file=sys.stderr)
+                            self._record_verification_result(
+                                verification_source_path,
+                                worksheet.title,
+                                verification_row_number,
+                                "Failed",
+                                str(exc),
+                                None,
+                            )
+            finally:
+                workbook.close()
 
         report_lines.append(
             "Extrascreen summary: processed={processed}, updated={updated}, failed={failed}".format(
@@ -2247,6 +2911,157 @@ class App:
             return value.strftime("%Y-%m-%d")
         return value
 
+    def _record_verification_result(
+        self,
+        source_path: str,
+        worksheet_name: str,
+        row_number: int,
+        status: str,
+        notes: str,
+        get_response: object | None,
+        verified_values: dict[str, object] | None = None,
+    ) -> None:
+        self._verification_recorder.record_row(
+            source_path=source_path,
+            worksheet_name=worksheet_name,
+            row_number=row_number,
+            status=status,
+            notes=notes,
+            get_response=get_response,
+            verified_values=verified_values,
+        )
+
+    @staticmethod
+    def _joined_notes(*notes: str) -> str:
+        return "; ".join(note for note in notes if note)
+
+    @staticmethod
+    def _build_extrascreen_verification_values(
+        header_row: tuple[object, ...],
+        col_map: dict[str, int],
+        mapping: list[tuple[str, str, bool]],
+        fetched_row: dict,
+    ) -> dict[str, object]:
+        verified_values: dict[str, object] = {}
+        for _, field_name, _ in mapping:
+            col_idx = col_map.get(field_name)
+            if not col_idx or col_idx > len(header_row):
+                continue
+            header_value = header_row[col_idx - 1]
+            header_text = str(header_value).strip() if header_value not in (None, "") else field_name
+            verified_values[f"Verified {header_text}"] = fetched_row.get(field_name)
+        return verified_values
+
+    @staticmethod
+    def _build_claim_verification_values(fetched_matter: dict) -> dict[str, object]:
+        return {
+            "Verified Claim Amount": fetched_matter.get("claimamount"),
+        }
+
+    @staticmethod
+    def _build_archive_verification_values(fetched_matter: dict) -> dict[str, object]:
+        return {
+            "Verified Archive Flag": fetched_matter.get("archiveflag"),
+            "Verified Archive Status": fetched_matter.get("archivestatus"),
+            "Verified Archive Status Description": fetched_matter.get("archivestatusdescription"),
+            "Verified Archive No": fetched_matter.get("archiveno"),
+        }
+
+    @staticmethod
+    def _build_reopen_verification_values(fetched_matter: dict) -> dict[str, object]:
+        return {
+            "Verified Archive Flag": fetched_matter.get("archiveflag"),
+            "Verified Archive Status": fetched_matter.get("archivestatus"),
+            "Verified Archive Status Description": fetched_matter.get("archivestatusdescription"),
+            "Verified Archive No": fetched_matter.get("archiveno"),
+            "Verified Archive Date": fetched_matter.get("archivedate"),
+        }
+
+    def _worksheet_data_start_row(self, worksheet, file_ref_idx: int) -> int:
+        first_row = next(
+            worksheet.iter_rows(min_row=1, max_row=1, max_col=max(file_ref_idx, 1), values_only=True),
+            tuple(),
+        )
+        file_ref_value = self._cell_text(first_row, file_ref_idx)
+        if file_ref_value and self._is_header_value(file_ref_value):
+            return 2
+        return 1
+
+    def _iter_processing_rows(
+        self,
+        worksheet,
+        max_col: int,
+        data_start_row: int,
+        header_row: list[object] | tuple[object, ...],
+    ) -> list[tuple[int, tuple[object, ...]]]:
+        rows = [
+            (row_number, tuple(row))
+            for row_number, row in enumerate(
+                worksheet.iter_rows(min_row=data_start_row, max_col=max_col, values_only=True),
+                start=data_start_row,
+            )
+        ]
+        ptp_capture_idx = self._find_header_index(header_row, {"ptpcapturedate"})
+        if not ptp_capture_idx:
+            return rows
+
+        return sorted(
+            rows,
+            key=lambda item: self._ptp_capture_sort_key(item[1], ptp_capture_idx, item[0]),
+        )
+
+    @staticmethod
+    def _find_header_index(header_row: list[object] | tuple[object, ...], expected_keys: set[str]) -> int | None:
+        for idx, value in enumerate(header_row, start=1):
+            if App._normalize_header(value) in expected_keys:
+                return idx
+        return None
+
+    def _ptp_capture_sort_key(
+        self,
+        row: tuple[object, ...],
+        column_idx: int,
+        row_number: int,
+    ) -> tuple[int, dt.datetime, int]:
+        value = self._cell_value(row, column_idx)
+        parsed = self._parse_processing_date(value)
+        if parsed is None:
+            return (1, dt.datetime.max, row_number)
+        return (0, parsed, row_number)
+
+    @staticmethod
+    def _parse_processing_date(value: object) -> dt.datetime | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, dt.datetime):
+            return value
+        if isinstance(value, dt.date):
+            return dt.datetime.combine(value, dt.time())
+        if isinstance(value, (int, float)):
+            try:
+                return EXCEL_BASE + dt.timedelta(days=float(value))
+            except (OverflowError, ValueError):
+                return None
+
+        text = str(value).strip()
+        if not text:
+            return None
+        date_text = text.split()[0].split("T")[0].replace("/", "-")
+        parts = date_text.split("-")
+        if len(parts) == 3 and all(parts):
+            if len(parts[0]) == 4:
+                normalized = f"{parts[0]}-{parts[1]}-{parts[2]}"
+            elif len(parts[2]) == 4:
+                normalized = f"{parts[2]}-{parts[1]}-{parts[0]}"
+            else:
+                normalized = date_text
+        else:
+            normalized = date_text
+        try:
+            return dt.datetime.strptime(normalized, "%Y-%m-%d")
+        except ValueError:
+            return None
+
     @staticmethod
     def _encode_legalsuite_date(value: object) -> int | None:
         if value in (None, ""):
@@ -2326,21 +3141,28 @@ class App:
             print(f"No cleaned closed files found: {panel_pattern} or {debt_pattern}")
             return
 
-        file_refs: set[str] = set()
+        file_ref_occurrences: dict[str, list[tuple[str, str, int]]] = {}
         missing_header_files = 0
         for cleaned_path in cleaned_files:
             download_path = self._download_path_for_cleaned(cleaned_path)
+            verification_source_path = download_path if os.path.exists(download_path) else cleaned_path
             col_info = self._find_fileref_column(download_path, cleaned_path)
             if not col_info:
                 report_lines.append(f"FileRef column not found: {cleaned_path}")
                 missing_header_files += 1
                 continue
             col_idx, col_name = col_info
-            refs = self._collect_file_refs(cleaned_path, col_idx)
+            refs = self._collect_file_ref_occurrences(verification_source_path, col_idx)
             if not refs:
                 report_lines.append(f"No file refs found using {col_name}: {cleaned_path}")
-            file_refs.update(refs)
+                continue
+            for file_ref, locations in refs.items():
+                file_ref_occurrences.setdefault(file_ref, []).extend(
+                    (verification_source_path, worksheet_name, row_number)
+                    for worksheet_name, row_number in locations
+                )
 
+        file_refs = set(file_ref_occurrences)
         if not file_refs:
             report_lines.append("No file references found to archive.")
             print("No file references found to archive.")
@@ -2367,41 +3189,328 @@ class App:
                 if self._args.archive_verbose:
                     print(f"Archive request for {file_ref}:")
                     print(json.dumps(payload, indent=2, default=str))
+                print(f"Archiving matter: {file_ref}")
                 result = client.update_matter(payload)
                 if self._args.archive_verbose:
                     print(f"Archive response for {file_ref}:")
                     print(json.dumps(result, indent=2, default=str))
-                archived_matter = client.get_matter_by_fileref(file_ref)
-                archive_flag = archived_matter.get("archiveflag")
-                archive_status = archived_matter.get("archivestatus")
-                archive_status_desc = archived_matter.get("archivestatusdescription")
+                verification_payload = payload
+                verification_fields = [
+                    "archiveflag",
+                    "archivestatus",
+                    "archivestatusdescription",
+                    "archiveno",
+                    "actual",
+                    "reserved",
+                    "invested",
+                    "transfer",
+                    "batchednormal",
+                ]
+                verification_status = "Verified"
+                verification_notes = ""
+                if is_archive_rejected_error(result):
+                    print(f"Archive rejected for {file_ref}; setting Pending Deletion...")
+                    pending_payload = client.build_pending_deletion_payload(
+                        matter=matter,
+                        logged_in_employee_id=logged_in_employee_id,
+                        archive_no=archive_no,
+                    )
+                    if self._args.archive_verbose:
+                        print(f"Pending Deletion request for {file_ref}:")
+                        print(json.dumps(pending_payload, indent=2, default=str))
+                    pending_result = client.update_matter(pending_payload)
+                    if self._args.archive_verbose:
+                        print(f"Pending Deletion response for {file_ref}:")
+                        print(json.dumps(pending_result, indent=2, default=str))
+                    archived_matter = client.get_matter_by_fileref(file_ref)
+                    print_matter_verification(
+                        "Pending Deletion fallback",
+                        pending_payload,
+                        archived_matter,
+                        field_names=["archiveflag", "archivestatus", "archivestatusdescription", "archiveno"],
+                    )
+                    verification_payload = pending_payload
+                    verification_fields = ["archiveflag", "archivestatus", "archivestatusdescription", "archiveno"]
+                    verification_status = "Verified (fallback)"
+                    verification_notes = "Archive rejected; Pending Deletion fallback used."
+                else:
+                    archived_matter = client.get_matter_by_fileref(file_ref)
+                    print_matter_verification(
+                        "Archive update",
+                        payload,
+                        archived_matter,
+                        field_names=[
+                            "archiveflag",
+                            "archivestatus",
+                            "archivestatusdescription",
+                            "archiveno",
+                            "actual",
+                            "reserved",
+                            "invested",
+                            "transfer",
+                            "batchednormal",
+                        ],
+                    )
+                fetched_archive_flag = archived_matter.get("archiveflag")
+                fetched_archive_status = archived_matter.get("archivestatus")
+                fetched_archive_status_desc = archived_matter.get("archivestatusdescription")
+
+                if normalize_compare_value(fetched_archive_status_desc).lower() == "live":
+                    print(f"Archive did not stick for {file_ref}; setting Pending Deletion...")
+                    pending_payload = client.build_pending_deletion_payload(
+                        matter=archived_matter,
+                        logged_in_employee_id=logged_in_employee_id,
+                        archive_no=archive_no,
+                    )
+                    if self._args.archive_verbose:
+                        print(f"Pending Deletion request for {file_ref}:")
+                        print(json.dumps(pending_payload, indent=2, default=str))
+                    pending_result = client.update_matter(pending_payload)
+                    if self._args.archive_verbose:
+                        print(f"Pending Deletion response for {file_ref}:")
+                        print(json.dumps(pending_result, indent=2, default=str))
+                    archived_matter = client.get_matter_by_fileref(file_ref)
+                    print_matter_verification(
+                        "Pending Deletion fallback",
+                        pending_payload,
+                        archived_matter,
+                        field_names=["archiveflag", "archivestatus", "archivestatusdescription", "archiveno"],
+                    )
+                    verification_payload = pending_payload
+                    verification_fields = ["archiveflag", "archivestatus", "archivestatusdescription", "archiveno"]
+                    verification_status = "Verified (fallback)"
+                    verification_notes = self._joined_notes(
+                        verification_notes,
+                        "Archive remained Live; Pending Deletion fallback used.",
+                    )
+                    fetched_archive_flag = archived_matter.get("archiveflag")
+                    fetched_archive_status = archived_matter.get("archivestatus")
+                    fetched_archive_status_desc = archived_matter.get("archivestatusdescription")
+
+                final_mismatches = compare_matter_payload_to_row(
+                    verification_payload,
+                    archived_matter,
+                    field_names=verification_fields,
+                )
+                if final_mismatches:
+                    mismatch_names = ", ".join(field_name for field_name, _, _ in final_mismatches)
+                    verification_status = "Mismatch"
+                    verification_notes = self._joined_notes(
+                        verification_notes,
+                        f"Mismatched fields: {mismatch_names}",
+                    )
+
+                for cleaned_path, worksheet_name, row_number in file_ref_occurrences.get(file_ref, []):
+                    self._record_verification_result(
+                        cleaned_path,
+                        worksheet_name,
+                        row_number,
+                        verification_status,
+                        verification_notes,
+                        archived_matter,
+                        self._build_archive_verification_values(archived_matter),
+                    )
+
                 archived += 1
                 report_lines.append(
                     "Archived matter: {file_ref} | archiveflag={archive_flag} | "
                     "archivestatus={archive_status} | archivestatusdescription={archive_status_desc}".format(
                         file_ref=file_ref,
-                        archive_flag=archive_flag,
-                        archive_status=archive_status,
-                        archive_status_desc=archive_status_desc,
+                        archive_flag=fetched_archive_flag,
+                        archive_status=fetched_archive_status,
+                        archive_status_desc=fetched_archive_status_desc,
                     )
                 )
                 print(
                     "Archived matter: {file_ref} | archiveflag={archive_flag} | "
                     "archivestatus={archive_status} | archivestatusdescription={archive_status_desc}".format(
                         file_ref=file_ref,
-                        archive_flag=archive_flag,
-                        archive_status=archive_status,
-                        archive_status_desc=archive_status_desc,
+                        archive_flag=fetched_archive_flag,
+                        archive_status=fetched_archive_status,
+                        archive_status_desc=fetched_archive_status_desc,
                     )
                 )
             except Exception as exc:
                 failed += 1
                 report_lines.append(f"Archive failed for {file_ref}: {exc}")
                 print(f"Archive failed for {file_ref}: {exc}", file=sys.stderr)
+                for cleaned_path, worksheet_name, row_number in file_ref_occurrences.get(file_ref, []):
+                    self._record_verification_result(
+                        cleaned_path,
+                        worksheet_name,
+                        row_number,
+                        "Failed",
+                        str(exc),
+                        None,
+                    )
 
         report_lines.append(
             "Archive summary: archived={archived}, failed={failed}, files_missing_header={missing}".format(
                 archived=archived,
+                failed=failed,
+                missing=missing_header_files,
+            )
+        )
+
+    def _reopen_matters(self, report_lines: list[str]) -> None:
+        if load_workbook is None:
+            report_lines.append("Reopen skipped: openpyxl is not installed.")
+            print("Reopen skipped: openpyxl is not installed.", file=sys.stderr)
+            return
+
+        api_key = self._args.api_key or os.getenv("LEGALSUITE_API_KEY") or LEGALSUITE_API_KEY
+        if not api_key:
+            report_lines.append("Reopen skipped: missing API key (use --api-key or LEGALSUITE_API_KEY).")
+            print("Reopen skipped: missing API key.", file=sys.stderr)
+            return
+
+        client = LegalSuiteClient(self._args.api_base, api_key)
+        logged_in_employee_id = self._args.logged_in_employee_id or LEGALSUITE_EMPLOYEE_ID
+        panel_pattern = os.path.join(
+            self._args.cleaned_dir,
+            "SBSA",
+            "Panel L",
+            "Reopen_APT_LSW",
+            self._date_ctx.month_year,
+            f"*_{self._date_ctx.date_str}.xlsx",
+        )
+        debt_pattern = os.path.join(
+            self._args.cleaned_dir,
+            "SBSA",
+            "Debt Review",
+            "Debt_Review_Reopen_APT_LSW",
+            f"Standard_Bank_Panel_L_Reopen_{self._date_ctx.date_str}_DR.xlsx",
+        )
+        cleaned_files = sorted(glob.glob(panel_pattern)) + sorted(glob.glob(debt_pattern))
+        if not cleaned_files:
+            report_lines.append(
+                f"No cleaned reopen files found: {panel_pattern} or {debt_pattern}"
+            )
+            print(f"No cleaned reopen files found: {panel_pattern} or {debt_pattern}")
+            return
+
+        file_ref_occurrences: dict[str, list[tuple[str, str, int]]] = {}
+        missing_header_files = 0
+        for cleaned_path in cleaned_files:
+            download_path = self._download_path_for_cleaned(cleaned_path)
+            verification_source_path = download_path if os.path.exists(download_path) else cleaned_path
+            col_info = self._find_fileref_column(download_path, cleaned_path)
+            if not col_info:
+                report_lines.append(f"FileRef column not found: {cleaned_path}")
+                missing_header_files += 1
+                continue
+            col_idx, col_name = col_info
+            refs = self._collect_file_ref_occurrences(verification_source_path, col_idx)
+            if not refs:
+                report_lines.append(f"No file refs found using {col_name}: {cleaned_path}")
+                continue
+            for file_ref, locations in refs.items():
+                file_ref_occurrences.setdefault(file_ref, []).extend(
+                    (verification_source_path, worksheet_name, row_number)
+                    for worksheet_name, row_number in locations
+                )
+
+        file_refs = set(file_ref_occurrences)
+        if not file_refs:
+            report_lines.append("No file references found to reopen.")
+            print("No file references found to reopen.")
+            return
+        print(f"Found {len(file_refs)} file references to process for reopen.")
+
+        reopened = 0
+        failed = 0
+        for file_ref in sorted(file_refs):
+            try:
+                matter = client.get_matter_by_fileref(file_ref)
+                if self._args.reopen_dry_run:
+                    reopened += 1
+                    print(f"Reopen dry-run: {file_ref}")
+                    print(matter)
+                    continue
+
+                payload = client.build_reopen_payload(
+                    matter=matter,
+                    logged_in_employee_id=logged_in_employee_id,
+                )
+                if self._args.reopen_verbose:
+                    print(f"Reopen request for {file_ref}:")
+                    print(json.dumps(payload, indent=2, default=str))
+                print(f"Reopening matter: {file_ref}")
+                result = client.update_matter(payload)
+                if self._args.reopen_verbose:
+                    print(f"Reopen response for {file_ref}:")
+                    print(json.dumps(result, indent=2, default=str))
+
+                reopened_matter = client.get_matter_by_fileref(file_ref)
+                print_matter_verification(
+                    "Reopen update",
+                    payload,
+                    reopened_matter,
+                    field_names=["archiveflag", "archivestatus", "archivestatusdescription", "archiveno"],
+                )
+                verification_status = "Verified"
+                verification_notes = ""
+                final_mismatches = compare_matter_payload_to_row(
+                    payload,
+                    reopened_matter,
+                    field_names=["archiveflag", "archivestatus", "archivestatusdescription", "archiveno"],
+                )
+                if final_mismatches:
+                    mismatch_names = ", ".join(field_name for field_name, _, _ in final_mismatches)
+                    verification_status = "Mismatch"
+                    verification_notes = f"Mismatched fields: {mismatch_names}"
+
+                fetched_archive_flag = reopened_matter.get("archiveflag")
+                fetched_archive_status = reopened_matter.get("archivestatus")
+                fetched_archive_status_desc = reopened_matter.get("archivestatusdescription")
+
+                for cleaned_path, worksheet_name, row_number in file_ref_occurrences.get(file_ref, []):
+                    self._record_verification_result(
+                        cleaned_path,
+                        worksheet_name,
+                        row_number,
+                        verification_status,
+                        verification_notes,
+                        reopened_matter,
+                        self._build_reopen_verification_values(reopened_matter),
+                    )
+
+                reopened += 1
+                report_lines.append(
+                    "Reopened matter: {file_ref} | archiveflag={archive_flag} | "
+                    "archivestatus={archive_status} | archivestatusdescription={archive_status_desc}".format(
+                        file_ref=file_ref,
+                        archive_flag=fetched_archive_flag,
+                        archive_status=fetched_archive_status,
+                        archive_status_desc=fetched_archive_status_desc,
+                    )
+                )
+                print(
+                    "Reopened matter: {file_ref} | archiveflag={archive_flag} | "
+                    "archivestatus={archive_status} | archivestatusdescription={archive_status_desc}".format(
+                        file_ref=file_ref,
+                        archive_flag=fetched_archive_flag,
+                        archive_status=fetched_archive_status,
+                        archive_status_desc=fetched_archive_status_desc,
+                    )
+                )
+            except Exception as exc:
+                failed += 1
+                report_lines.append(f"Reopen failed for {file_ref}: {exc}")
+                print(f"Reopen failed for {file_ref}: {exc}", file=sys.stderr)
+                for cleaned_path, worksheet_name, row_number in file_ref_occurrences.get(file_ref, []):
+                    self._record_verification_result(
+                        cleaned_path,
+                        worksheet_name,
+                        row_number,
+                        "Failed",
+                        str(exc),
+                        None,
+                    )
+
+        report_lines.append(
+            "Reopen summary: reopened={reopened}, failed={failed}, files_missing_header={missing}".format(
+                reopened=reopened,
                 failed=failed,
                 missing=missing_header_files,
             )
@@ -2445,39 +3554,124 @@ class App:
                 continue
 
             workbook = load_workbook(claim_path, read_only=False, data_only=True)
-            for worksheet in workbook.worksheets:
-                max_col = worksheet.max_column or max(file_ref_idx, claim_amount_idx)
-                for row in worksheet.iter_rows(min_row=2, max_col=max_col, values_only=True):
-                    file_ref = self._cell_text(row, file_ref_idx)
-                    claim_amount = self._normalize_claim_amount(self._cell_value(row, claim_amount_idx))
-                    if not file_ref or claim_amount is None:
-                        continue
-                    try:
-                        matter = client.get_matter_by_fileref(file_ref)
-                        payload = client.build_claim_amount_payload(
-                            matter=matter,
-                            logged_in_employee_id=logged_in_employee_id,
-                            claim_amount=claim_amount,
-                        )
-                        processed += 1
-                        if self._args.claim_amount_dry_run:
-                            print(f"Claim amount dry-run: {file_ref} -> {claim_amount}")
-                            if self._args.claim_amount_verbose:
-                                print(json.dumps(payload, indent=2, default=str))
+            try:
+                for worksheet in workbook.worksheets:
+                    max_col = worksheet.max_column or max(file_ref_idx, claim_amount_idx)
+                    for row_number, row in enumerate(
+                        worksheet.iter_rows(min_row=2, max_col=max_col, values_only=True),
+                        start=2,
+                    ):
+                        file_ref = self._cell_text(row, file_ref_idx)
+                        claim_amount = self._normalize_claim_amount(self._cell_value(row, claim_amount_idx))
+                        if not file_ref or claim_amount is None:
                             continue
-                        if self._args.claim_amount_verbose:
-                            print(f"Claim amount update payload for {file_ref}:")
-                            print(json.dumps(payload, indent=2, default=str))
-                        result = client.update_matter(payload)
-                        if self._args.claim_amount_verbose:
-                            print(f"Claim amount update response for {file_ref}:")
-                            print(json.dumps(result, indent=2, default=str))
-                        print(f"Claim amount updated: {file_ref} -> {claim_amount}")
-                        updated += 1
-                    except Exception as exc:
-                        failed += 1
-                        report_lines.append(f"Claim amount update failed for {file_ref}: {exc}")
-                        print(f"Claim amount update failed for {file_ref}: {exc}", file=sys.stderr)
+                        try:
+                            matter = client.get_matter_by_fileref(file_ref)
+                            payload = client.build_claim_amount_payload(
+                                matter=matter,
+                                logged_in_employee_id=logged_in_employee_id,
+                                claim_amount=claim_amount,
+                            )
+                            processed += 1
+                            if self._args.claim_amount_dry_run:
+                                print(f"Claim amount dry-run: {file_ref} -> {claim_amount}")
+                                if self._args.claim_amount_verbose:
+                                    print(json.dumps(payload, indent=2, default=str))
+                                continue
+                            if self._args.claim_amount_verbose:
+                                print(f"Claim amount update payload for {file_ref}:")
+                                print(json.dumps(payload, indent=2, default=str))
+                            result = client.update_matter(payload)
+                            if self._args.claim_amount_verbose:
+                                print(f"Claim amount update response for {file_ref}:")
+                                print(json.dumps(result, indent=2, default=str))
+                            print(f"Claim amount updated: {file_ref} -> {claim_amount}")
+                            fetched_matter = client.get_matter_by_fileref(file_ref)
+                            verification_status = "Verified"
+                            verification_notes = ""
+                            claim_mismatches = compare_matter_payload_to_row(
+                                payload,
+                                fetched_matter,
+                                field_names=["claimamount"],
+                            )
+                            if claim_mismatches:
+                                print("  Claim amount update verification mismatches: claimamount")
+                                for field_name, sent_value, fetched_value in claim_mismatches:
+                                    print(f"    {field_name}: sent={sent_value!r} fetched={fetched_value!r}")
+                                update_error_text = extract_update_error_text(result).strip()
+                                verification_status = "Mismatch"
+                                verification_notes = self._joined_notes(
+                                    "Mismatched fields: claimamount",
+                                    update_error_text if update_error_text not in {"", "{}", "[]"} else "",
+                                )
+                                if update_error_text and update_error_text not in {"{}", "[]"}:
+                                    print(f"  Claim amount update response message: {update_error_text}")
+                                if is_old_code_unique_error(result):
+                                    print(
+                                        f"  Retrying claim amount update for {file_ref} using File Ref-only payload..."
+                                    )
+                                    fallback_payload = client.build_claim_amount_fileref_only_payload(
+                                        matter=matter,
+                                        file_ref=file_ref,
+                                        logged_in_employee_id=logged_in_employee_id,
+                                        claim_amount=claim_amount,
+                                    )
+                                    if self._args.claim_amount_verbose:
+                                        print(f"Claim amount fallback payload for {file_ref}:")
+                                        print(json.dumps(fallback_payload, indent=2, default=str))
+                                    fallback_result = client.update_matter(fallback_payload)
+                                    if self._args.claim_amount_verbose:
+                                        print(f"Claim amount fallback response for {file_ref}:")
+                                        print(json.dumps(fallback_result, indent=2, default=str))
+                                    fetched_matter = client.get_matter_by_fileref(file_ref)
+                                    fallback_mismatches = compare_matter_payload_to_row(
+                                        fallback_payload,
+                                        fetched_matter,
+                                        field_names=["claimamount"],
+                                    )
+                                    if fallback_mismatches:
+                                        print("  Claim amount fallback verification mismatches: claimamount")
+                                        for field_name, sent_value, fetched_value in fallback_mismatches:
+                                            print(f"    {field_name}: sent={sent_value!r} fetched={fetched_value!r}")
+                                        fallback_error_text = extract_update_error_text(fallback_result).strip()
+                                        verification_status = "Mismatch"
+                                        verification_notes = self._joined_notes(
+                                            "Fallback mismatch on claimamount",
+                                            fallback_error_text if fallback_error_text not in {"", "{}", "[]"} else "",
+                                        )
+                                        if fallback_error_text and fallback_error_text not in {"{}", "[]"}:
+                                            print(f"  Claim amount fallback response message: {fallback_error_text}")
+                                    else:
+                                        verification_status = "Verified (fallback)"
+                                        verification_notes = "Fallback File Ref-only payload verified."
+                                        print("  Claim amount fallback verified: claimamount")
+                            else:
+                                print("  Claim amount update verified: claimamount")
+
+                            self._record_verification_result(
+                                claim_path,
+                                worksheet.title,
+                                row_number,
+                                verification_status,
+                                verification_notes,
+                                fetched_matter,
+                                self._build_claim_verification_values(fetched_matter),
+                            )
+                            updated += 1
+                        except Exception as exc:
+                            failed += 1
+                            report_lines.append(f"Claim amount update failed for {file_ref}: {exc}")
+                            print(f"Claim amount update failed for {file_ref}: {exc}", file=sys.stderr)
+                            self._record_verification_result(
+                                claim_path,
+                                worksheet.title,
+                                row_number,
+                                "Failed",
+                                str(exc),
+                                None,
+                            )
+            finally:
+                workbook.close()
 
         report_lines.append(
             "Claim amount summary: processed={processed}, updated={updated}, "
@@ -2493,22 +3687,32 @@ class App:
         rel_path = os.path.relpath(cleaned_path, self._args.cleaned_dir)
         return os.path.join(self._args.download_dir, rel_path)
 
-    def _collect_file_refs(self, cleaned_path: str, col_idx: int) -> list[str]:
-        refs: list[str] = []
+    def _collect_file_ref_occurrences(
+        self,
+        cleaned_path: str,
+        col_idx: int,
+    ) -> dict[str, list[tuple[str, int]]]:
+        occurrences: dict[str, list[tuple[str, int]]] = {}
         workbook = load_workbook(cleaned_path, read_only=False, data_only=True)
-        for worksheet in workbook.worksheets:
-            max_col = worksheet.max_column or col_idx
-            for row in worksheet.iter_rows(min_row=1, max_col=max_col, values_only=True):
-                if not row or len(row) < col_idx:
-                    continue
-                value = row[col_idx - 1]
-                if value is None:
-                    continue
-                text = str(value).strip()
-                if not text or self._is_header_value(text):
-                    continue
-                refs.append(text)
-        return refs
+        try:
+            for worksheet in workbook.worksheets:
+                max_col = worksheet.max_column or col_idx
+                for row_number, row in enumerate(
+                    worksheet.iter_rows(min_row=1, max_col=max_col, values_only=True),
+                    start=1,
+                ):
+                    if not row or len(row) < col_idx:
+                        continue
+                    value = row[col_idx - 1]
+                    if value is None:
+                        continue
+                    text = str(value).strip()
+                    if not text or self._is_header_value(text):
+                        continue
+                    occurrences.setdefault(text, []).append((worksheet.title, row_number))
+        finally:
+            workbook.close()
+        return occurrences
 
     def _find_fileref_column(self, download_path: str, cleaned_path: str) -> tuple[int, str] | None:
         header_row = self._read_header_row(download_path) or self._read_header_row(cleaned_path)
@@ -2516,7 +3720,7 @@ class App:
             return None
         for idx, value in enumerate(header_row, start=1):
             key = self._normalize_header(value)
-            if key in {"fileref", "filereference"}:
+            if key in {"fileref", "filereference", "matterref", "matterreference"}:
                 return idx, "fileref"
         return None
 
@@ -2584,7 +3788,7 @@ class App:
 
     @staticmethod
     def _is_header_value(value: str) -> bool:
-        return App._normalize_header(value) in {"fileref", "filereference"}
+        return App._normalize_header(value) in {"fileref", "filereference", "matterref", "matterreference"}
 
     @staticmethod
     def _resolve_date(date_arg: str | None, days_ago: int) -> DateContext:
@@ -2680,6 +3884,11 @@ class App:
             help="Local base directory for cleaned files (default: cleaned).",
         )
         parser.add_argument(
+            "--verification-dir",
+            default="verification",
+            help="Local base directory for verification workbooks (default: verification).",
+        )
+        parser.add_argument(
             "--skip-clean",
             action="store_true",
             help="Skip cleaning downloaded files.",
@@ -2710,6 +3919,11 @@ class App:
             help="LegalSuite logged-in employee ID for handover-created matters and parties (default: 174).",
         )
         parser.add_argument(
+            "--handover-email-test",
+            action="store_true",
+            help="Send the handover report to the test recipients instead of the production recipients.",
+        )
+        parser.add_argument(
             "--archive-closed",
             action="store_true",
             help="Update closed matters in LegalSuite using cleaned closed files.",
@@ -2723,6 +3937,21 @@ class App:
             "--archive-verbose",
             action="store_true",
             help="Print LegalSuite update payload and response to the console.",
+        )
+        parser.add_argument(
+            "--reopen-matters",
+            action="store_true",
+            help="Reopen matters in LegalSuite using cleaned reopen files.",
+        )
+        parser.add_argument(
+            "--reopen-dry-run",
+            action="store_true",
+            help="Only fetch matters for reopen files; do not update.",
+        )
+        parser.add_argument(
+            "--reopen-verbose",
+            action="store_true",
+            help="Print LegalSuite reopen payload and response to the console.",
         )
         parser.add_argument(
             "--update-extrascreen",

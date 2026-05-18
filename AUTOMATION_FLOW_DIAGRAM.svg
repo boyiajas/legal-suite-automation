@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1480" height="980" viewBox="0 0 1480 980">
+  <defs>
+    <style>
+      .title { font: 700 30px Arial, sans-serif; fill: #172033; }
+      .subtitle { font: 500 17px Arial, sans-serif; fill: #475569; }
+      .label { font: 700 18px Arial, sans-serif; fill: #172033; }
+      .small { font: 500 15px Arial, sans-serif; fill: #334155; }
+      .main { fill: #f8fbff; stroke: #2563eb; stroke-width: 2.5; rx: 16; ry: 16; }
+      .branch { fill: #f2f9ff; stroke: #0891b2; stroke-width: 2.2; rx: 16; ry: 16; }
+      .verify { fill: #fffbea; stroke: #d97706; stroke-width: 2.2; rx: 16; ry: 16; }
+      .output { fill: #f0fdf4; stroke: #16a34a; stroke-width: 2.2; rx: 16; ry: 16; }
+      .decision { fill: #fff7ed; stroke: #ea580c; stroke-width: 2.2; }
+      .line { stroke: #475569; stroke-width: 2.6; fill: none; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <rect width="1480" height="980" fill="#ffffff"/>
+
+  <text x="70" y="58" class="title">FTP Download Automation: Flow Mapping</text>
+  <text x="70" y="88" class="subtitle">Abstract view of how files move from FTP and local staging into LegalSuite, verification, audit outputs, and email reporting.</text>
+
+  <rect x="80" y="130" width="230" height="72" class="main"/>
+  <text x="195" y="174" text-anchor="middle" class="label">1. Date Selection</text>
+
+  <rect x="360" y="130" width="260" height="72" class="main"/>
+  <text x="490" y="174" text-anchor="middle" class="label">2. File Discovery</text>
+
+  <rect x="670" y="130" width="300" height="72" class="main"/>
+  <text x="820" y="174" text-anchor="middle" class="label">3. Download or Reuse Files</text>
+
+  <rect x="1020" y="130" width="300" height="72" class="main"/>
+  <text x="1170" y="174" text-anchor="middle" class="label">4. Cleaning and Standardization</text>
+
+  <path d="M310 166 H360" class="line"/>
+  <path d="M620 166 H670" class="line"/>
+  <path d="M970 166 H1020" class="line"/>
+
+  <polygon points="1170,260 1260,325 1170,390 1080,325" class="decision"/>
+  <text x="1170" y="318" text-anchor="middle" class="label">Enabled</text>
+  <text x="1170" y="340" text-anchor="middle" class="label">Processes</text>
+
+  <path d="M1170 202 V260" class="line"/>
+
+  <rect x="70" y="470" width="260" height="92" class="branch"/>
+  <text x="200" y="510" text-anchor="middle" class="label">5A. Handover Processing</text>
+  <text x="200" y="538" text-anchor="middle" class="small">Matter creation, party creation, MatParty, handover extrascreens</text>
+
+  <rect x="380" y="470" width="260" height="92" class="branch"/>
+  <text x="510" y="510" text-anchor="middle" class="label">5B. Extrascreen Updates</text>
+  <text x="510" y="538" text-anchor="middle" class="small">Feedback, PTP, and POC-Summons screens</text>
+
+  <rect x="690" y="470" width="260" height="92" class="branch"/>
+  <text x="820" y="510" text-anchor="middle" class="label">5C. Claim Amount Updates</text>
+  <text x="820" y="538" text-anchor="middle" class="small">Matter claimamount updates from claim file</text>
+
+  <rect x="1000" y="470" width="260" height="92" class="branch"/>
+  <text x="1130" y="510" text-anchor="middle" class="label">5D. Archive / Reopen</text>
+  <text x="1130" y="538" text-anchor="middle" class="small">Matter status transitions from closed and reopen files</text>
+
+  <path d="M1110 384 V430 H200 V470" class="line"/>
+  <path d="M1150 390 V430 H510 V470" class="line"/>
+  <path d="M1190 390 V430 H820 V470" class="line"/>
+  <path d="M1230 384 V430 H1130 V470" class="line"/>
+
+  <rect x="470" y="680" width="540" height="100" class="verify"/>
+  <text x="740" y="722" text-anchor="middle" class="label">6. Verification GET Checks After Each Update</text>
+  <text x="740" y="752" text-anchor="middle" class="small">Fetch LegalSuite data again and compare returned values against the intended payload</text>
+
+  <path d="M200 562 V620 H620 V680" class="line"/>
+  <path d="M510 562 V650" class="line"/>
+  <path d="M820 562 V620 H860 V680" class="line"/>
+  <path d="M1130 562 V620 H930 V680" class="line"/>
+
+  <rect x="190" y="855" width="360" height="90" class="output"/>
+  <text x="370" y="895" text-anchor="middle" class="label">7. Logs and Verification Workbooks</text>
+  <text x="370" y="922" text-anchor="middle" class="small">Audit trail, statuses, returned values, row-level evidence</text>
+
+  <rect x="900" y="855" width="360" height="90" class="output"/>
+  <text x="1080" y="895" text-anchor="middle" class="label">8. Handover Report and Email</text>
+  <text x="1080" y="922" text-anchor="middle" class="small">Generated only when handover produces reportable output</text>
+
+  <path d="M640 780 V820 H370 V855" class="line"/>
+  <path d="M840 780 V820 H1080 V855" class="line"/>
+</svg>

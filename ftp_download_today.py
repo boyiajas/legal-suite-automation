@@ -2448,6 +2448,9 @@ class App:
             print("No handover files were available.")
             return
 
+        for working_file in working_files:
+            print(f"Handover file: {working_file}")
+
         if self._args.handover_email_test:
             print("Handover email test mode: generating report from handover rows only.")
             preview_rows, row_unknown_codes = read_handover_rows(working_files)
@@ -2635,9 +2638,8 @@ class App:
         failed = 0
 
         for cleaned_path, mapping in feedback_files + ptp_files + poc_summons_files:
-            if self._args.extrascreen_verbose:
-                label = self._extrascreen_mapping_label(mapping)
-                print(f"Extrascreen file ({label}): {cleaned_path}")
+            label = self._extrascreen_mapping_label(mapping)
+            print(f"Extrascreen file ({label}): {cleaned_path}")
             download_path = self._download_path_for_cleaned(cleaned_path)
             verification_source_path = download_path if os.path.exists(download_path) else cleaned_path
             header_row = self._read_header_row(download_path)
@@ -3144,6 +3146,7 @@ class App:
         file_ref_occurrences: dict[str, list[tuple[str, str, int]]] = {}
         missing_header_files = 0
         for cleaned_path in cleaned_files:
+            print(f"Closed file: {cleaned_path}")
             download_path = self._download_path_for_cleaned(cleaned_path)
             verification_source_path = download_path if os.path.exists(download_path) else cleaned_path
             col_info = self._find_fileref_column(download_path, cleaned_path)
@@ -3392,6 +3395,7 @@ class App:
         file_ref_occurrences: dict[str, list[tuple[str, str, int]]] = {}
         missing_header_files = 0
         for cleaned_path in cleaned_files:
+            print(f"Reopen file: {cleaned_path}")
             download_path = self._download_path_for_cleaned(cleaned_path)
             verification_source_path = download_path if os.path.exists(download_path) else cleaned_path
             col_info = self._find_fileref_column(download_path, cleaned_path)
@@ -3542,6 +3546,7 @@ class App:
         missing_headers = 0
 
         for claim_path in claim_files:
+            print(f"Claim amount file: {claim_path}")
             header_row = self._read_header_row(claim_path)
             if not header_row:
                 report_lines.append(f"Claim amount header not found: {claim_path}")

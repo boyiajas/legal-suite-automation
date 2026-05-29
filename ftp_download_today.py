@@ -202,10 +202,12 @@ CREATE_DEFAULTS = {
 }
 
 PARTY_DEFAULTS = {
-    "party[partytypeid]": 1,
-    "party[defaultlanguageid]": 1,
-    "party[createdid]": 1,
-    "party[parlang][languageid]": 1,
+    "partytypeid": 1,
+    "defaultlanguageid": 1,
+    "createdid": 1,
+    "parlang[languageid]": 1,
+    "parlang[partytypeid]": 1,
+    "parlang[defaultlanguageid]": 1,
 }
 
 MATPARTY_DEFAULTS = {
@@ -213,6 +215,13 @@ MATPARTY_DEFAULTS = {
     "sorter": 1,
     "languageid": 0,
     "reference": "",
+}
+
+PARTELE_TYPE_IDS = {
+    "home": 4,
+    "cell": 5,
+    "email": 7,
+    "work": 8,
 }
 
 HANDOVER_REPORT_TO = [
@@ -225,6 +234,8 @@ HANDOVER_REPORT_TO = [
 HANDOVER_REPORT_CC = [
     "agashnee.pillay@iconis.co.za",
     "thileshnee.chinnasamy@iconis.co.za",
+    "dev@iconis.co.za",
+    "alkha.sewsunker@iconis.co.za"
 ]
 
 HANDOVER_REPORT_TEST_TO = [
@@ -234,6 +245,8 @@ HANDOVER_REPORT_TEST_TO = [
 HANDOVER_REPORT_TEST_CC = [
     "boyiajas@gmail.com",
 ]
+
+HANDOVER_REPORT_FTP_DIR = "Matter Ref Updates"
 
 LEGALSUITE_MAX_ATTEMPTS = 3
 LEGALSUITE_RETRY_DELAYS = (2, 5)
@@ -270,12 +283,28 @@ class HandoverCreatedMatter:
     description: str
 
 
+@dataclass(frozen=True)
+class HandoverProcessResult:
+    created_matters: list[HandoverCreatedMatter]
+    processed_matters: list[HandoverCreatedMatter]
+
+
+class HandoverDebugStop(Exception):
+    pass
+
+
 @dataclass
 class VerificationWorkbookState:
     source_path: str
     verification_path: str
     workbook: object
     header_indexes: dict[str, dict[str, int]]
+
+
+COMPLETION_LOG_REPORT_TO = [
+    "helpdesk@iconis.co.za",
+    "dev@iconis.co.za",
+]
 
 
 class VerificationWorkbookRecorder:
@@ -498,6 +527,31 @@ class FTPClient:
         with open(local_path, "wb") as handle:
             ftp.retrbinary(f"RETR {remote_path}", handle.write)
 
+    def ensure_remote_dir(self, remote_dir: str) -> None:
+        ftp = self._require()
+        if not remote_dir or remote_dir == ".":
+            return
+
+        current_dir = ftp.pwd()
+        try:
+            parts = [part for part in remote_dir.split("/") if part and part != "."]
+            for part in parts:
+                try:
+                    ftp.cwd(part)
+                except ftplib.error_perm:
+                    ftp.mkd(part)
+                    ftp.cwd(part)
+        finally:
+            ftp.cwd(current_dir)
+
+    def upload_file(self, local_path: str, remote_path: str) -> None:
+        ftp = self._require()
+        remote_dir = os.path.dirname(remote_path).replace("\\", "/")
+        if remote_dir:
+            self.ensure_remote_dir(remote_dir)
+        with open(local_path, "rb") as handle:
+            ftp.storbinary(f"STOR {remote_path}", handle)
+
     def _require(self) -> ftplib.FTP:
         if not self._ftp:
             raise RuntimeError("FTP client not connected")
@@ -514,6 +568,42 @@ def post_with_retry(
     for attempt in range(1, LEGALSUITE_MAX_ATTEMPTS + 1):
         try:
             response = requests.post(url, headers=headers, data=data, timeout=timeout)
+            if response.status_code >= 500:
+                response.raise_for_status()
+            return response
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+            retryable = isinstance(exc, (requests.Timeout, requests.ConnectionError))
+            if isinstance(exc, requests.HTTPError):
+                status_code = exc.response.status_code if exc.response is not None else None
+                retryable = status_code is not None and status_code >= 500
+
+            last_exc = exc
+            if not retryable or attempt >= LEGALSUITE_MAX_ATTEMPTS:
+                raise
+
+            delay = LEGALSUITE_RETRY_DELAYS[min(attempt - 1, len(LEGALSUITE_RETRY_DELAYS) - 1)]
+            print(
+                "LegalSuite request failed "
+                f"(attempt {attempt}/{LEGALSUITE_MAX_ATTEMPTS}): {exc}. "
+                f"Retrying in {delay}s..."
+            )
+            time.sleep(delay)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("LegalSuite request failed without an exception")
+
+
+def post_json_with_retry(
+    url: str,
+    headers: dict[str, str],
+    json_payload,
+    timeout: int,
+) -> requests.Response:
+    last_exc: Exception | None = None
+    for attempt in range(1, LEGALSUITE_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.post(url, headers=headers, json=json_payload, timeout=timeout)
             if response.status_code >= 500:
                 response.raise_for_status()
             return response
@@ -735,6 +825,11 @@ def is_old_code_unique_error(result: dict | str) -> bool:
     return "already has this old code" in error_text and "old code must be unique" in error_text
 
 
+def is_parlang_missing_error(result: dict | str) -> bool:
+    error_text = extract_update_error_text(result).lower()
+    return "no parlang record was sent" in error_text and "party->parlang" in error_text
+
+
 class LegalSuiteLookupClient:
     def __init__(self, api_base: str, api_key: str) -> None:
         self._api_base = api_base.rstrip("/")
@@ -818,6 +913,29 @@ class LegalSuiteLookupClient:
         except ValueError:
             return response.text
 
+    def update_party(self, recordid: int | str, updates: dict) -> dict | str:
+        url = f"{self._api_base}/party/update"
+        payload = {
+            "recordid": str(recordid),
+        }
+        for key, value in updates.items():
+            payload[key] = str(value)
+        response = post_with_retry(url, headers=self._headers(), data=payload, timeout=60)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
+
+    def create_party_json(self, data: dict) -> dict | str:
+        url = f"{self._api_base}/party/store"
+        response = post_json_with_retry(url, headers=self._json_headers(), json_payload=data, timeout=60)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
+
     def get_party_by_identitynumber(self, identity_number: str) -> list[dict]:
         url = f"{self._api_base}/party/get"
         data = {
@@ -839,6 +957,17 @@ class LegalSuiteLookupClient:
         payload = response.json()
         return payload.get("data", [])
 
+    def get_matparty_by_matter_and_role(self, matter_id: int | str, roleid: int | str) -> list[dict]:
+        url = f"{self._api_base}/matparty/get"
+        data = [
+            ("where[]", f"MatParty.MatterID,=,{matter_id}"),
+            ("where[]", f"MatParty.RoleID,=,{roleid}"),
+        ]
+        response = post_with_retry(url, headers=self._headers(), data=data, timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("data", [])
+
     def create_matparty(self, data: dict) -> dict | str:
         url = f"{self._api_base}/matparty/store"
         payload = {key: str(value) for key, value in data.items()}
@@ -848,6 +977,26 @@ class LegalSuiteLookupClient:
             return response.json()
         except ValueError:
             return response.text
+
+    def create_partele(self, data: dict) -> dict | str:
+        url = f"{self._api_base}/partele/store"
+        payload = {key: str(value) for key, value in data.items()}
+        response = post_with_retry(url, headers=self._headers(), data=payload, timeout=60)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
+
+    def get_partele_by_partyid(self, partyid: int | str) -> list[dict]:
+        url = f"{self._api_base}/partele/get"
+        data = {
+            "where[]": f"ParTele.PartyID,=,{partyid}",
+        }
+        response = post_with_retry(url, headers=self._headers(), data=data, timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("data", [])
 
     def update_matter_extrascreen(self, data: dict) -> dict | str:
         url = f"{self._api_base}/matdocsc/update"
@@ -874,6 +1023,12 @@ class LegalSuiteLookupClient:
         return {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/x-www-form-urlencoded",
+        }
+
+    def _json_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
         }
 
 
@@ -1355,6 +1510,26 @@ def add_payload_value(payload: dict[str, object], field_name: str, value: object
         payload[field_name] = normalized
 
 
+def add_party_parlang_value(payload: dict[str, object], field_name: str, value: object) -> None:
+    normalized = normalize_cell_value(value)
+    if normalized in (None, ""):
+        return
+    payload[f"parlang[{field_name}]"] = normalized
+
+
+def normalize_employee_recordid(
+    value: object,
+    fallback: object = CREATE_DEFAULTS["loggedinemployeeid"],
+) -> str:
+    candidate = value
+    if candidate in (None, ""):
+        candidate = fallback
+    text = str(candidate).strip()
+    if not text:
+        text = str(fallback).strip()
+    return text
+
+
 def build_party_create_payload(
     row: HandoverRow,
     date_ctx: DateContext,
@@ -1364,34 +1539,259 @@ def build_party_create_payload(
     name = build_debtor_name(row) or build_description(row)
     imported_date = dt.datetime.strptime(date_ctx.date_str, "%Y%m%d")
     notes = f"Imported on {imported_date.strftime('%d %B %Y')}"
+    employee_recordid = normalize_employee_recordid(logged_in_employee_id)
 
     payload: dict[str, object] = {}
     payload.update(PARTY_DEFAULTS)
-    payload["party[name]"] = name
-    payload["party[matterprefix]"] = build_party_prefix(row)
-    payload["party[updatedbydate]"] = encode_legalsuite_date(now)
-    payload["party[updatedbytime]"] = encode_legalsuite_time(now)
-    payload["party[createdid]"] = logged_in_employee_id
-    payload["party[notes]"] = notes
+    payload["name"] = name
+    payload["matterprefix"] = build_party_prefix(row)
+    payload["updatedbydate"] = encode_legalsuite_date(now)
+    payload["updatedbytime"] = encode_legalsuite_time(now)
+    payload["createdid"] = employee_recordid
+    payload["notes"] = notes
+    payload["parlang[name]"] = name
 
     identity_number = digits_only(get_row_value(row, "ID Number"))
     if identity_number:
-        payload["party[identitynumber]"] = identity_number
+        payload["identitynumber"] = identity_number
 
-    add_payload_value(payload, "party[parlang][salutation]", get_row_value(row, "Debtor Title"))
-    add_payload_value(payload, "party[parlang][physicalline1]", get_row_value(row, "Physical Address Line 1"))
-    add_payload_value(payload, "party[parlang][physicalline2]", get_row_value(row, "Physical Address Line 2"))
-    add_payload_value(payload, "party[parlang][physicalline3]", get_row_value(row, "Physical Address Line 3"))
-    add_payload_value(payload, "party[parlang][physicalcode]", get_row_value(row, "Physical Postal Code"))
-    add_payload_value(payload, "party[parlang][postalline1]", get_row_value(row, "Postal Address Line 1"))
-    add_payload_value(payload, "party[parlang][postalline2]", get_row_value(row, "Postal Address Line 2"))
-    add_payload_value(payload, "party[parlang][postalline3]", get_row_value(row, "Postal Address Line 3"))
-    add_payload_value(payload, "party[parlang][postalcode]", get_row_value(row, "Postal Code"))
-    add_payload_value(payload, "party[parlang][homenumber]", get_row_value(row, "Telephone (Home)"))
-    add_payload_value(payload, "party[parlang][worknumber]", get_row_value(row, "Telephone (Work)"))
-    add_payload_value(payload, "party[parlang][cellnumber]", get_row_value(row, "Cell Phone"))
-    add_payload_value(payload, "party[parlang][emailaddress]", get_row_value(row, "DefendantEmail"))
+    add_party_parlang_value(payload, "salutation", get_row_value(row, "Debtor Title"))
+    add_party_parlang_value(payload, "physicalline1", get_row_value(row, "Physical Address Line 1"))
+    add_party_parlang_value(payload, "physicalline2", get_row_value(row, "Physical Address Line 2"))
+    add_party_parlang_value(payload, "physicalline3", get_row_value(row, "Physical Address Line 3"))
+    add_party_parlang_value(payload, "physicalcode", get_row_value(row, "Physical Postal Code"))
+    add_party_parlang_value(payload, "postalline1", get_row_value(row, "Postal Address Line 1"))
+    add_party_parlang_value(payload, "postalline2", get_row_value(row, "Postal Address Line 2"))
+    add_party_parlang_value(payload, "postalline3", get_row_value(row, "Postal Address Line 3"))
+    add_party_parlang_value(payload, "postalcode", get_row_value(row, "Postal Code"))
     return {key: value for key, value in payload.items() if value not in (None, "")}
+
+
+def build_party_create_json_payload(
+    row: HandoverRow,
+    date_ctx: DateContext,
+    logged_in_employee_id: str,
+) -> dict[str, object]:
+    now = dt.datetime.now()
+    name = build_debtor_name(row) or build_description(row)
+    imported_date = dt.datetime.strptime(date_ctx.date_str, "%Y%m%d")
+    notes = f"Imported on {imported_date.strftime('%d %B %Y')}"
+    employee_recordid = normalize_employee_recordid(logged_in_employee_id)
+
+    def normalized(value: object) -> object | None:
+        value = normalize_cell_value(value)
+        return None if value in (None, "") else value
+
+    parlang = {
+        "languageid": 1,
+    }
+    for field_name, header_name in (
+        ("salutation", "Debtor Title"),
+        ("physicalline1", "Physical Address Line 1"),
+        ("physicalline2", "Physical Address Line 2"),
+        ("physicalline3", "Physical Address Line 3"),
+        ("physicalcode", "Physical Postal Code"),
+        ("postalline1", "Postal Address Line 1"),
+        ("postalline2", "Postal Address Line 2"),
+        ("postalline3", "Postal Address Line 3"),
+        ("postalcode", "Postal Code"),
+    ):
+        value = normalized(get_row_value(row, header_name))
+        if value is not None:
+            parlang[field_name] = value
+
+    party: dict[str, object] = {
+        "partytypeid": 1,
+        "defaultlanguageid": 1,
+        "createdid": employee_recordid,
+        "name": name,
+        "matterprefix": build_party_prefix(row),
+        "updatedbydate": encode_legalsuite_date(now),
+        "updatedbytime": encode_legalsuite_time(now),
+        "notes": notes,
+        "parlang": parlang,
+    }
+
+    identity_number = digits_only(get_row_value(row, "ID Number"))
+    if identity_number:
+        party["identitynumber"] = identity_number
+
+    return {
+        "createdid": employee_recordid,
+        "loggedinemployeeid": employee_recordid,
+        "party": party,
+    }
+
+
+def build_party_update_payload(
+    row: HandoverRow,
+    date_ctx: DateContext,
+    logged_in_employee_id: str,
+) -> dict[str, object]:
+    create_payload = build_party_create_payload(row, date_ctx, logged_in_employee_id)
+    return {key: value for key, value in create_payload.items() if key != "createdid"}
+
+
+def build_partele_payloads(row: HandoverRow, partyid: int | str) -> list[tuple[str, dict[str, object]]]:
+    payloads: list[tuple[str, dict[str, object]]] = []
+    for sorter, (label, header_name, telephonetypeid) in enumerate(
+        (
+            ("home", "Telephone (Home)", PARTELE_TYPE_IDS["home"]),
+            ("cell", "Cell Phone", PARTELE_TYPE_IDS["cell"]),
+            ("work", "Telephone (Work)", PARTELE_TYPE_IDS["work"]),
+            ("email", "DefendantEmail", PARTELE_TYPE_IDS["email"]),
+        ),
+        start=1,
+    ):
+        number = normalize_cell_value(get_row_value(row, header_name))
+        if number in (None, ""):
+            continue
+        payloads.append(
+            (
+                label,
+                {
+                    "partyid": partyid,
+                    "telephonetypeid": telephonetypeid,
+                    "number": number,
+                    "sorter": sorter,
+                },
+            )
+        )
+    return payloads
+
+
+def find_debtor_partyid_for_matter(client: LegalSuiteLookupClient, matterid: int | str) -> str | None:
+    debtor_matparties = client.get_matparty_by_matter_and_role(matterid, 103)
+    if not debtor_matparties:
+        return None
+    debtor_partyid = str(debtor_matparties[0].get("partyid") or "").strip()
+    return debtor_partyid or None
+
+
+def resolve_debtor_partyid_for_matter(client: LegalSuiteLookupClient, matterid: int | str) -> str:
+    debtor_partyid = find_debtor_partyid_for_matter(client, matterid)
+    if not debtor_partyid:
+        raise ValueError(f"No MatParty row found for matterid {matterid} and roleid 103.")
+    return debtor_partyid
+
+
+def create_or_reuse_handover_party(
+    client: LegalSuiteLookupClient,
+    row: HandoverRow,
+    date_ctx: DateContext,
+    logged_in_employee_id: str,
+) -> tuple[str, bool]:
+    party_payload = build_party_create_payload(row, date_ctx, logged_in_employee_id)
+    identity_number = digits_only(get_row_value(row, "ID Number"))
+    existing_party = None
+    if identity_number:
+        matches = client.get_party_by_identitynumber(identity_number)
+        if matches:
+            existing_party = matches[0]
+
+    if existing_party:
+        partyid = str(existing_party["recordid"])
+        print(f"  Reusing existing partyid: {partyid}")
+        return partyid, False
+
+    party_createdid = str(party_payload.get("createdid") or "").strip()
+    if not party_createdid:
+        raise ValueError("Party payload is missing CreatedId for handover party creation.")
+    print("  Creating party...")
+    created_party = client.create_party(party_payload)
+    try:
+        partyid = extract_created_recordid(created_party)
+    except ValueError:
+        if not is_parlang_missing_error(created_party):
+            raise
+        print("  Retrying party create with nested Party->ParLang JSON payload...")
+        created_party = client.create_party_json(
+            build_party_create_json_payload(row, date_ctx, logged_in_employee_id)
+        )
+        partyid = extract_created_recordid(created_party)
+    print(f"  Created partyid: {partyid}")
+    return partyid, True
+
+
+def ensure_debtor_party_for_matter(
+    client: LegalSuiteLookupClient,
+    row: HandoverRow,
+    matterid: int | str,
+    date_ctx: DateContext,
+    logged_in_employee_id: str,
+    dry_run: bool,
+) -> str | None:
+    debtor_partyid = find_debtor_partyid_for_matter(client, matterid)
+    if debtor_partyid:
+        return debtor_partyid
+
+    print("  No MatParty role 103 found for this matter.")
+    if dry_run:
+        print("  Dry-run: would create or attach debtor party and MatParty role 103.")
+        return None
+
+    partyid, _ = create_or_reuse_handover_party(client, row, date_ctx, logged_in_employee_id)
+    existing_matparty = client.get_matparty_by_matter_and_party(matterid, partyid)
+    if existing_matparty:
+        print(f"  MatParty link already exists: recordid {existing_matparty[0].get('recordid')}")
+    else:
+        print("  Creating MatParty link...")
+        matparty_payload = build_matparty_create_payload(matterid, partyid)
+        created_matparty = client.create_matparty(matparty_payload)
+        matparty_recordid = extract_created_recordid(created_matparty)
+        print(f"  Linked matparty recordid: {matparty_recordid}")
+
+    debtor_partyid = resolve_debtor_partyid_for_matter(client, matterid)
+    return debtor_partyid
+
+
+def sync_handover_party_contacts(
+    client: LegalSuiteLookupClient,
+    row: HandoverRow,
+    partyid: int | str,
+    dry_run: bool,
+) -> None:
+    partele_payloads = build_partele_payloads(row, partyid)
+    if not partele_payloads:
+        print("  No party contact data to create.")
+        return
+
+    if dry_run:
+        print("  Dry-run: would create missing party contacts.")
+        return
+
+    existing_contacts = client.get_partele_by_partyid(partyid)
+    print("  Syncing party contacts...")
+    for contact_label, partele_payload in partele_payloads:
+        wanted_typeid = normalize_compare_value(partele_payload["telephonetypeid"])
+        wanted_number = normalize_compare_value(partele_payload["number"]).lower()
+        match = next(
+            (
+                contact
+                for contact in existing_contacts
+                if normalize_compare_value(contact.get("telephonetypeid")) == wanted_typeid
+                and normalize_compare_value(contact.get("number")).lower() == wanted_number
+            ),
+            None,
+        )
+        if match:
+            print(
+                "  {label} contact already exists: typeid={typeid}".format(
+                    label=contact_label,
+                    typeid=partele_payload["telephonetypeid"],
+                )
+            )
+            continue
+
+        print(
+            "  Creating {label} contact: typeid={typeid}".format(
+                label=contact_label,
+                typeid=partele_payload["telephonetypeid"],
+            )
+        )
+        created_partele = client.create_partele(partele_payload)
+        partele_recordid = extract_created_recordid(created_partele)
+        print(f"  Created {contact_label} contact recordid: {partele_recordid}")
 
 
 def build_matparty_create_payload(matterid: int | str, partyid: int | str) -> dict[str, object]:
@@ -1456,6 +1856,66 @@ def build_desktop_extrascreen_payloads(row: HandoverRow) -> list[tuple[str, dict
 
     flush_current()
     return payloads
+
+
+def dump_handover_row_payloads_and_stop(
+    row: HandoverRow,
+    file_ref: str,
+    date_ctx: DateContext,
+    logged_in_employee_id: str,
+) -> None:
+    matter_payload = build_matter_create_payload(row, file_ref, date_ctx, logged_in_employee_id)
+    matter_update_payload = {
+        "recordid": "<created-matter-recordid>",
+        **build_matter_description_update_payload(matter_payload, logged_in_employee_id),
+    }
+    party_payload = build_party_create_payload(row, date_ctx, logged_in_employee_id)
+    party_json_payload = build_party_create_json_payload(row, date_ctx, logged_in_employee_id)
+    matparty_payload = build_matparty_create_payload("<created-matter-recordid>", "<created-party-recordid>")
+    extrascreen_payloads = build_desktop_extrascreen_payloads(row)
+
+    debug_payloads = {
+        "latest_matter_lookup": [
+            ("where[]", f"Matter.ClientID,=,{row.client_id}"),
+            ("where[]", f"Matter.FileRef,like,{row.client_code}/%"),
+        ],
+        "existing_matter_by_fileref": {
+            "where[]": f"Matter.FileRef,=,{file_ref}",
+        },
+        "existing_matter_by_reference": (
+            [
+                ("where[]", f"Matter.ClientID,=,{row.client_id}"),
+                ("where[]", f"Matter.TheirRef,=,{row.reference}"),
+            ]
+            if row.reference
+            else None
+        ),
+        "matter_create_payload": matter_payload,
+        "matter_update_payload": matter_update_payload,
+        "party_lookup_by_identitynumber": (
+            {"where[]": f"Party.IdentityNumber,=,{identity_number}"}
+            if (identity_number := digits_only(get_row_value(row, "ID Number")))
+            else None
+        ),
+        "party_create_form_payload": party_payload,
+        "party_create_json_payload": party_json_payload,
+        "matparty_existing_lookup": [
+            ("where[]", "MatParty.MatterID,=,<created-matter-recordid>"),
+            ("where[]", "MatParty.PartyID,=,<created-party-recordid>"),
+        ],
+        "matparty_create_payload": matparty_payload,
+        "matparty_lookup_by_roleid_103": [
+            ("where[]", "MatParty.MatterID,=,<created-matter-recordid>"),
+            ("where[]", "MatParty.RoleID,=,103"),
+        ],
+        "partele_payloads": build_partele_payloads(row, "<resolved-partyid-from-matparty-role-103>"),
+        "desktop_extrascreen_payloads": extrascreen_payloads,
+    }
+
+    print("  Handover debug payload dump:")
+    print(json.dumps(debug_payloads, indent=2, default=str))
+    print("  Stopping after handover payload dump.")
+    raise HandoverDebugStop()
 
 
 def extract_created_recordid(created_response: dict | str) -> str:
@@ -1678,7 +2138,8 @@ def create_and_update_handover_matters(
     logged_in_employee_id: str,
     create_matters: bool,
     create_limit: int | None,
-) -> list[HandoverCreatedMatter]:
+    debug_stop_row: int | None,
+) -> HandoverProcessResult:
     next_numbers: dict[str, tuple[int, int]] = {
         code: next_ref_sequence_start(next_ref)
         for code, next_ref in next_refs_by_code.items()
@@ -1686,6 +2147,7 @@ def create_and_update_handover_matters(
 
     processed_count = 0
     created_matters: list[HandoverCreatedMatter] = []
+    processed_matters: list[HandoverCreatedMatter] = []
     print("\nMatter create/update:")
     for row in rows:
         if create_limit is not None and processed_count >= create_limit:
@@ -1704,16 +2166,47 @@ def create_and_update_handover_matters(
             f"new fileref {file_ref}"
         )
 
+        if debug_stop_row is not None and row.row_number == debug_stop_row:
+            dump_handover_row_payloads_and_stop(row, file_ref, date_ctx, logged_in_employee_id)
+
         print("  Checking for existing matter...")
         existing_matter = find_existing_matter_for_row(client, row, file_ref)
         if existing_matter:
             existing_recordid = str(existing_matter.get("recordid"))
+            processed_matters.append(
+                HandoverCreatedMatter(
+                    file_ref=str(existing_matter.get("fileref") or file_ref),
+                    their_reference=str(existing_matter.get("theirref") or row.reference or ""),
+                    description=str(existing_matter.get("description") or build_description(row)),
+                )
+            )
             print(
                 "  Skipped: matter already exists "
                 f"recordid {existing_recordid} "
                 f"fileref {existing_matter.get('fileref')} "
                 f"theirref {existing_matter.get('theirref')}"
             )
+            print("  Resolving debtor partyid from MatParty role 103...")
+            debtor_partyid = ensure_debtor_party_for_matter(
+                client,
+                row,
+                existing_recordid,
+                date_ctx,
+                logged_in_employee_id,
+                dry_run=not create_matters,
+            )
+            if not debtor_partyid:
+                update_handover_row_desktop_extrascreens(client, row, existing_recordid, dry_run=not create_matters)
+                continue
+            print(f"  Resolved debtor partyid: {debtor_partyid}")
+            party_update_payload = build_party_update_payload(row, date_ctx, logged_in_employee_id)
+            if create_matters:
+                print("  Updating debtor party (role 103)...")
+                client.update_party(debtor_partyid, party_update_payload)
+                print("  Updated debtor party (role 103)")
+            else:
+                print("  Dry-run: would update debtor party (role 103).")
+            sync_handover_party_contacts(client, row, debtor_partyid, dry_run=not create_matters)
             update_handover_row_desktop_extrascreens(client, row, existing_recordid, dry_run=not create_matters)
             continue
 
@@ -1739,6 +2232,7 @@ def create_and_update_handover_matters(
                 description=str(payload.get("description") or ""),
             )
         )
+        processed_matters.append(created_matters[-1])
         matter_after_create = fetch_matter_row(client, recordid)
         print(f"  Matter claimamount after create: {matter_after_create.get('claimamount')}")
 
@@ -1765,21 +2259,7 @@ def create_and_update_handover_matters(
             print("  No tracked matter fields changed after description update.")
 
         print("  Checking for existing party...")
-        identity_number = digits_only(get_row_value(row, "ID Number"))
-        existing_party = None
-        if identity_number:
-            matches = client.get_party_by_identitynumber(identity_number)
-            if matches:
-                existing_party = matches[0]
-
-        if existing_party:
-            partyid = str(existing_party["recordid"])
-            print(f"  Reusing existing partyid: {partyid}")
-        else:
-            print("  Creating party...")
-            created_party = client.create_party(party_payload)
-            partyid = extract_created_recordid(created_party)
-            print(f"  Created partyid: {partyid}")
+        partyid, _ = create_or_reuse_handover_party(client, row, date_ctx, logged_in_employee_id)
 
         print("  Checking MatParty link...")
         existing_matparty = client.get_matparty_by_matter_and_party(recordid, partyid)
@@ -1792,6 +2272,11 @@ def create_and_update_handover_matters(
             matparty_recordid = extract_created_recordid(created_matparty)
             print(f"  Linked matparty recordid: {matparty_recordid}")
 
+        print("  Resolving debtor partyid from MatParty role 103...")
+        debtor_partyid = resolve_debtor_partyid_for_matter(client, recordid)
+        print(f"  Resolved debtor partyid: {debtor_partyid}")
+        sync_handover_party_contacts(client, row, debtor_partyid, dry_run=False)
+
         matter_after_matparty = fetch_matter_row(client, recordid)
         print(f"  Matter claimamount after MatParty step: {matter_after_matparty.get('claimamount')}")
         changed_after_matparty = find_changed_fields(matter_after_update, matter_after_matparty, tracked_fields)
@@ -1803,7 +2288,10 @@ def create_and_update_handover_matters(
 
         update_handover_row_desktop_extrascreens(client, row, recordid, dry_run=False)
 
-    return created_matters
+    return HandoverProcessResult(
+        created_matters=created_matters,
+        processed_matters=processed_matters,
+    )
 
 
 def process_handover_files(
@@ -1815,7 +2303,8 @@ def process_handover_files(
     create_dry_run: bool,
     create_limit: int | None,
     logged_in_employee_id: str,
-) -> list[HandoverCreatedMatter]:
+    debug_stop_row: int | None,
+) -> HandoverProcessResult:
     code_counts: dict[str, int] = {}
     unknown_codes: list[str] = []
     code_references: dict[str, list[str]] = {}
@@ -1837,7 +2326,7 @@ def process_handover_files(
 
     if not code_counts:
         print("No Client Code values found in the downloaded handover files.")
-        return []
+        return HandoverProcessResult(created_matters=[], processed_matters=[])
 
     if unknown_codes:
         print("Unknown client codes in Excel:", ", ".join(sorted(unknown_codes)))
@@ -1882,9 +2371,10 @@ def process_handover_files(
             logged_in_employee_id=logged_in_employee_id,
             create_matters=create_matters,
             create_limit=create_limit,
+            debug_stop_row=debug_stop_row,
         )
 
-    return []
+    return HandoverProcessResult(created_matters=[], processed_matters=[])
 
 
 def build_handover_report_preview_entries(
@@ -2169,6 +2659,9 @@ class App:
         )
 
     def run(self) -> int:
+        if self._args.send_report_log_only:
+            return self._send_report_log_only()
+
         report_lines = [
             f"Report date: {self._date_ctx.date_str}",
             f"Month folder: {self._date_ctx.month_year}",
@@ -2222,7 +2715,19 @@ class App:
             return return_code
         finally:
             self._finalize_verification_workbooks(report_lines)
-            self._write_report(report_lines)
+            log_path = self._write_report(report_lines)
+            if log_path:
+                self._send_completion_log_email(log_path, report_lines)
+
+    def _send_report_log_only(self) -> int:
+        log_path = self._args.log_file
+        if not log_path:
+            log_path = os.path.join(self._args.download_dir, f"report_{self._date_ctx.date_str}.txt")
+        if not os.path.isfile(log_path):
+            print(f"Report log file not found: {log_path}", file=sys.stderr)
+            return 1
+        report_lines: list[str] = []
+        return 0 if self._send_completion_log_email(log_path, report_lines) else 1
 
     def _finalize_verification_workbooks(self, report_lines: list[str]) -> None:
         try:
@@ -2373,17 +2878,138 @@ class App:
             unique_dirs.append(item)
         return unique_dirs
 
-    def _write_report(self, report_lines: list[str]) -> None:
+    def _write_report(self, report_lines: list[str]) -> str | None:
         log_path = self._args.log_file
         if not log_path:
             log_path = os.path.join(self._args.download_dir, f"report_{self._date_ctx.date_str}.txt")
         os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        summary_lines = self._build_report_summary(report_lines)
         try:
             print("Writing report log...")
             with open(log_path, "w", encoding="utf-8") as handle:
                 handle.write("\n".join(report_lines) + "\n")
+                if summary_lines:
+                    handle.write("\n" + "\n".join(summary_lines) + "\n")
         except OSError as exc:
             print(f"Failed to write log file {log_path}: {exc}", file=sys.stderr)
+            return None
+        return log_path
+
+    def _build_report_summary(self, report_lines: list[str]) -> list[str]:
+        def find_last(prefixes: tuple[str, ...]) -> str | None:
+            for line in reversed(report_lines):
+                if any(line.startswith(prefix) for prefix in prefixes):
+                    return line
+            return None
+
+        enabled_sections: list[str] = ["handover" if not self._args.skip_handover else "handover-skipped"]
+        if self._args.update_extrascreen:
+            enabled_sections.append("extrascreen")
+        if self._args.update_claim_amount:
+            enabled_sections.append("claim-amount")
+        if self._args.archive_closed:
+            enabled_sections.append("archive")
+        if self._args.reopen_matters:
+            enabled_sections.append("reopen")
+        if self._args.clean_only:
+            enabled_sections.append("clean-only")
+        if self._args.skip_clean:
+            enabled_sections.append("skip-clean")
+
+        summary_lines = [
+            "----- At-a-Glance Summary -----",
+            f"Date: {self._date_ctx.date_str}",
+            f"Month Folder: {self._date_ctx.month_year}",
+            f"Enabled Sections: {', '.join(enabled_sections)}",
+        ]
+
+        important_lines = [
+            find_last(("Summary: ",)),
+            find_last(("Handover processing completed", "Handover processing skipped", "Handover test report generated")),
+            find_last(("Handover report generated: ", "Handover report skipped: ")),
+            find_last(("Handover email sent: ", "Handover email skipped: ", "Handover email failed: ")),
+            find_last(("Handover report uploaded to FTP: ", "Handover report FTP upload failed: ")),
+            find_last(("Extrascreen summary: ", "Extrascreen update skipped: ")),
+            find_last(("Claim amount summary: ", "Claim amount update skipped: ")),
+            find_last(("Archive summary: ", "Archive skipped: ")),
+            find_last(("Reopen summary: ", "Reopen skipped: ")),
+            find_last(("Verification workbook summary: ", "Verification workbook save failed: ")),
+        ]
+
+        for line in important_lines:
+            if line:
+                summary_lines.append(line)
+
+        return summary_lines
+
+    def _send_completion_log_email(self, log_path: str, report_lines: list[str]) -> bool:
+        smtp_host = os.getenv("MAIL_HOST", os.getenv("SMTP_HOST", "")).strip()
+        smtp_port = int(os.getenv("MAIL_PORT", os.getenv("SMTP_PORT", "587")).strip() or "587")
+        smtp_user = os.getenv("MAIL_USERNAME", os.getenv("SMTP_USER", "")).strip()
+        smtp_pass = os.getenv("MAIL_PASSWORD", os.getenv("SMTP_PASS", "")).strip()
+        smtp_from = os.getenv("MAIL_FROM_ADDRESS", os.getenv("SMTP_FROM", smtp_user)).strip()
+        auth_mode = os.getenv("MAIL_AUTH_MODE", os.getenv("SMTP_AUTH_MODE", "login")).strip().lower()
+        smtp_use_auth = auth_mode not in {"none", "noauth", "false", "0", "no"}
+        encryption = os.getenv("MAIL_ENCRYPTION", "").strip().lower()
+        smtp_use_tls = encryption not in {"", "null", "none", "false", "0", "no"} if "MAIL_ENCRYPTION" in os.environ else (
+            os.getenv("SMTP_USE_TLS", "true").strip().lower() not in {"0", "false", "no"}
+        )
+
+        missing = [name for name, value in (("SMTP_HOST", smtp_host), ("SMTP_FROM", smtp_from)) if not value]
+        if missing:
+            message = f"Completion log email skipped: missing SMTP settings: {', '.join(missing)}"
+            report_lines.append(message)
+            print(message)
+            return False
+
+        message = EmailMessage()
+        subject_timestamp = dt.datetime.now().strftime("%Y/%m/%d %-H:%M")
+        message["Subject"] = f"LegalSuite Daily Reports Completed Log -- {subject_timestamp}"
+        message["From"] = smtp_from
+        message["To"] = ", ".join(COMPLETION_LOG_REPORT_TO)
+        message.set_content(
+            "Good Day,\n\n"
+            "Please find attached the automation completion log for the selected run.\n\n"
+            "Kind Regards,\n"
+        )
+
+        with open(log_path, "rb") as handle:
+            message.add_attachment(
+                handle.read(),
+                maintype="text",
+                subtype="plain",
+                filename=os.path.basename(log_path),
+            )
+
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                if attempt > 1:
+                    print(f"Retrying completion log email (attempt {attempt}/3)...")
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as server:
+                    if smtp_use_tls:
+                        server.starttls()
+                    if smtp_use_auth and smtp_user:
+                        server.login(smtp_user, smtp_pass)
+                    server.send_message(
+                        message,
+                        from_addr=smtp_from,
+                        to_addrs=COMPLETION_LOG_REPORT_TO,
+                    )
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                report_lines.append(f"Completion log email attempt {attempt}/3 failed: {exc}")
+                print(f"Completion log email attempt {attempt}/3 failed: {exc}", file=sys.stderr)
+
+        if last_exc is not None:
+            report_lines.append(f"Completion log email failed: {last_exc}")
+            return False
+
+        report_lines.append("Completion log email sent: to=helpdesk@iconis.co.za, dev@iconis.co.za")
+        print("Completion log email sent: to=helpdesk@iconis.co.za, dev@iconis.co.za")
+        return True
 
     def _resolve_handover_files(self, base_dir: str, label: str) -> list[str]:
         resolved_files: list[str] = []
@@ -2471,7 +3097,14 @@ class App:
             report_path = self._write_handover_report(preview_entries)
             report_lines.append(f"Handover test report generated: {report_path}")
             print(f"Handover test report generated: {report_path}")
-            self._send_handover_report_email(report_path, preview_entries, report_lines)
+            if self._args.skip_handover_email:
+                report_lines.append("Handover email skipped: --skip-handover-email.")
+                print("Handover email skipped: --skip-handover-email.")
+                self._upload_handover_report_to_ftp(report_path, report_lines)
+            else:
+                email_sent = self._send_handover_report_email(report_path, preview_entries, report_lines)
+                if email_sent:
+                    self._upload_handover_report_to_ftp(report_path, report_lines)
             return
 
         api_key = self._args.api_key or os.getenv("LEGALSUITE_API_KEY") or LEGALSUITE_API_KEY
@@ -2480,7 +3113,7 @@ class App:
             print("Handover processing skipped: missing API key.", file=sys.stderr)
             return
 
-        created_matters = process_handover_files(
+        handover_result = process_handover_files(
             paths=working_files,
             api_base=self._args.api_base,
             api_key=api_key,
@@ -2489,6 +3122,7 @@ class App:
             create_dry_run=self._args.handover_dry_run,
             create_limit=self._args.handover_create_limit,
             logged_in_employee_id=self._args.handover_logged_in_employee_id,
+            debug_stop_row=self._args.handover_debug_stop_row,
         )
         report_lines.append(
             "Handover processing completed for {count} file(s).".format(count=len(working_files))
@@ -2496,15 +3130,27 @@ class App:
         if self._args.handover_dry_run:
             report_lines.append("Handover email skipped: dry-run mode.")
             return
-        if not created_matters:
-            report_lines.append("Handover email skipped: no new matters were created.")
-            print("No new handover matters were created; report email skipped.")
+        report_items = (
+            handover_result.processed_matters
+            if self._args.skip_handover_email
+            else handover_result.created_matters
+        )
+        if not report_items:
+            report_lines.append("Handover report skipped: no processed handover rows were available.")
+            print("No processed handover rows were available for the report.")
             return
 
-        report_path = self._write_handover_report(created_matters)
+        report_path = self._write_handover_report(report_items)
         report_lines.append(f"Handover report generated: {report_path}")
         print(f"Handover report generated: {report_path}")
-        self._send_handover_report_email(report_path, created_matters, report_lines)
+        if self._args.skip_handover_email:
+            report_lines.append("Handover email skipped: --skip-handover-email.")
+            print("Handover email skipped: --skip-handover-email.")
+            self._upload_handover_report_to_ftp(report_path, report_lines)
+        else:
+            email_sent = self._send_handover_report_email(report_path, handover_result.created_matters, report_lines)
+            if email_sent:
+                self._upload_handover_report_to_ftp(report_path, report_lines)
 
     def _write_handover_report(self, created_matters: list[HandoverCreatedMatter]) -> str:
         if Workbook is None:
@@ -2536,12 +3182,14 @@ class App:
         report_path: str,
         created_matters: list[HandoverCreatedMatter],
         report_lines: list[str],
-    ) -> None:
+    ) -> bool:
         smtp_host = os.getenv("MAIL_HOST", os.getenv("SMTP_HOST", "")).strip()
         smtp_port = int(os.getenv("MAIL_PORT", os.getenv("SMTP_PORT", "587")).strip() or "587")
         smtp_user = os.getenv("MAIL_USERNAME", os.getenv("SMTP_USER", "")).strip()
         smtp_pass = os.getenv("MAIL_PASSWORD", os.getenv("SMTP_PASS", "")).strip()
         smtp_from = os.getenv("MAIL_FROM_ADDRESS", os.getenv("SMTP_FROM", smtp_user)).strip()
+        auth_mode = os.getenv("MAIL_AUTH_MODE", os.getenv("SMTP_AUTH_MODE", "login")).strip().lower()
+        smtp_use_auth = auth_mode not in {"none", "noauth", "false", "0", "no"}
         encryption = os.getenv("MAIL_ENCRYPTION", "").strip().lower()
         smtp_use_tls = encryption not in {"", "null", "none", "false", "0", "no"} if "MAIL_ENCRYPTION" in os.environ else (
             os.getenv("SMTP_USE_TLS", "true").strip().lower() not in {"0", "false", "no"}
@@ -2552,7 +3200,7 @@ class App:
             message = f"Handover email skipped: missing SMTP settings: {', '.join(missing)}"
             report_lines.append(message)
             print(message)
-            return
+            return False
 
         to_recipients = HANDOVER_REPORT_TEST_TO if self._args.handover_email_test else HANDOVER_REPORT_TO
         cc_recipients = HANDOVER_REPORT_TEST_CC if self._args.handover_email_test else HANDOVER_REPORT_CC
@@ -2584,13 +3232,13 @@ class App:
             with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as server:
                 if smtp_use_tls:
                     server.starttls()
-                if smtp_user:
+                if smtp_use_auth and smtp_user:
                     server.login(smtp_user, smtp_pass)
                 server.send_message(message, from_addr=smtp_from, to_addrs=all_recipients)
         except Exception as exc:
             report_lines.append(f"Handover email failed: {exc}")
             print(f"Handover email failed: {exc}", file=sys.stderr)
-            return
+            return False
 
         report_lines.append(
             "Handover email sent: to={to_count}, cc={cc_count}, test_mode={test_mode}".format(
@@ -2606,6 +3254,24 @@ class App:
                 test_mode=self._args.handover_email_test,
             )
         )
+        return True
+
+    def _upload_handover_report_to_ftp(self, report_path: str, report_lines: list[str]) -> None:
+        print(f"Uploading handover report to FTP: {HANDOVER_REPORT_FTP_DIR}/{os.path.basename(report_path)}")
+        client = FTPClient(FTP_HOST, FTP_USER, FTP_PASS, self._args.timeout)
+        try:
+            client.connect()
+            remote_path = f"{HANDOVER_REPORT_FTP_DIR}/{os.path.basename(report_path)}"
+            client.upload_file(report_path, remote_path)
+        except Exception as exc:
+            report_lines.append(f"Handover report FTP upload failed: {exc}")
+            print(f"Handover report FTP upload failed: {exc}", file=sys.stderr)
+            return
+        finally:
+            client.close()
+
+        report_lines.append(f"Handover report uploaded to FTP: {HANDOVER_REPORT_FTP_DIR}/{os.path.basename(report_path)}")
+        print(f"Handover report uploaded to FTP: {HANDOVER_REPORT_FTP_DIR}/{os.path.basename(report_path)}")
 
     def _update_matter_extrascreens(self, report_lines: list[str]) -> None:
         if load_workbook is None:
@@ -3884,6 +4550,11 @@ class App:
             help="Write a report log to this path (default: <download-dir>/report_YYYYMMDD.txt).",
         )
         parser.add_argument(
+            "--send-report-log-only",
+            action="store_true",
+            help="Only send the already-created daily report log email for the selected date and exit.",
+        )
+        parser.add_argument(
             "--cleaned-dir",
             default="cleaned",
             help="Local base directory for cleaned files (default: cleaned).",
@@ -3919,6 +4590,11 @@ class App:
             help="Limit how many handover rows are processed.",
         )
         parser.add_argument(
+            "--handover-debug-stop-row",
+            type=int,
+            help="Dump all handover payloads for the selected 1-based row number and stop before any LegalSuite call for that row.",
+        )
+        parser.add_argument(
             "--handover-logged-in-employee-id",
             default=str(CREATE_DEFAULTS["loggedinemployeeid"]),
             help="LegalSuite logged-in employee ID for handover-created matters and parties (default: 174).",
@@ -3927,6 +4603,11 @@ class App:
             "--handover-email-test",
             action="store_true",
             help="Send the handover report to the test recipients instead of the production recipients.",
+        )
+        parser.add_argument(
+            "--skip-handover-email",
+            action="store_true",
+            help="Skip sending the handover report email, but still generate the report and upload it to FTP.",
         )
         parser.add_argument(
             "--archive-closed",
@@ -4021,6 +4702,8 @@ def main() -> int:
         args = App.parse_args()
         app = App(args)
         return app.run()
+    except HandoverDebugStop:
+        return 0
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2

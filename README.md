@@ -30,15 +30,33 @@ Mail settings for handover report email:
 
 ```env
 MAIL_MAILER=smtp
-MAIL_HOST=
-MAIL_PORT=2525
+MAIL_HOST=za-smtp-outbound-1.mimecast.co.za
+MAIL_PORT=25
 MAIL_USERNAME=
 MAIL_PASSWORD=
+MAIL_AUTH_MODE=none
 MAIL_ENCRYPTION=tls
-MAIL_FROM_ADDRESS=
+MAIL_FROM_ADDRESS=voip-umh@straussdaly.co.za
+
+MAIL_TEST_HOST=sandbox.smtp.mailtrap.io
+MAIL_TEST_PORT=2525
+MAIL_TEST_USERNAME=
+MAIL_TEST_PASSWORD=
+MAIL_TEST_AUTH_MODE=login
+MAIL_TEST_ENCRYPTION=null
+MAIL_TEST_FROM_ADDRESS=dev@iconis.co.za
+
+MAIL_PROD_HOST=za-smtp-outbound-1.mimecast.co.za
+MAIL_PROD_PORT=25
+MAIL_PROD_USERNAME=
+MAIL_PROD_PASSWORD=
+MAIL_PROD_AUTH_MODE=none
+MAIL_PROD_ENCRYPTION=tls
+MAIL_PROD_FROM_ADDRESS=voip-umh@straussdaly.co.za
 ```
 
 The script also accepts the older `SMTP_*` names, but `MAIL_*` is the preferred format.
+The production Mimecast relay is currently configured to use STARTTLS on port `25` with no SMTP AUTH, based on source IP allowlisting.
 
 ## Main script
 
@@ -57,6 +75,7 @@ By default it:
 5. optionally runs extrascreen, claim amount, archive, and reopen updates when those flags are supplied
 6. writes verification workbooks into `verification/` for processed update files
 7. writes a report log to `downloads/report_YYYYMMDD.txt` unless `--log-file` is supplied
+8. emails the completed report log to `helpdesk@iconis.co.za` and `dev@iconis.co.za`
 
 ## Date selection
 
@@ -139,15 +158,33 @@ What the handover flow does:
 7. updates the matter description and related fields
 8. creates or reuses the debtor party
 9. creates or reuses the MatParty link
-10. updates Desktop Extra Screen data from the handover row when present
-11. generates an Excel report for newly created matters
-12. emails the handover report with the Excel attached
+10. resolves the debtor party through `MatParty` role `103`
+11. updates only that debtor party when the matter already exists
+12. creates missing party contacts using `partele/store`
+13. updates Desktop Extra Screen data from the handover row when present
+14. generates an Excel report
+15. emails the handover report with the Excel attached unless `--skip-handover-email` is used
+16. uploads the handover report to FTP into `Matter Ref Updates`
 
 Handover report columns:
 
 - `Matter File Reference`
 - `Their Reference`
 - `Matter Description`
+
+Handover report locations:
+
+- local output:
+  - `downloads/handover_reports/handover_created_matters_<YYYYMMDD>_<timestamp>.xlsx`
+- FTP drop-off:
+  - `Matter Ref Updates/<same filename>.xlsx`
+
+Handover report scope:
+
+- normal live email flow:
+  - newly created handover matters only
+- `--skip-handover-email`:
+  - all processed handover rows
 
 Live handover report recipients:
 
@@ -170,6 +207,8 @@ Handover options:
   - `python3 ftp_download_today.py --handover-logged-in-employee-id 174`
 - test report email mode:
   - `python3 ftp_download_today.py --handover-email-test`
+- skip only the handover email, but still generate and FTP-upload the report:
+  - `python3 ftp_download_today.py --skip-handover-email`
 
 `--handover-email-test` behavior:
 
@@ -179,6 +218,7 @@ Handover options:
 - reads the handover rows directly
 - generates a preview Excel report
 - sends the report to test recipients only
+- uploads the report to FTP into `Matter Ref Updates` after a successful email send
 
 Test recipients:
 
@@ -374,6 +414,18 @@ This keeps the terminal output, but also leaves a saved Excel audit trail of wha
 - Full live daily run including handover creation and live handover report email:
   - `python3 ftp_download_today.py --update-extrascreen --update-claim-amount --archive-closed --reopen-matters`
 
+- Full live daily run including handover processing, but skip only the handover email and still FTP-upload the report:
+  - `python3 ftp_download_today.py --update-extrascreen --update-claim-amount --archive-closed --reopen-matters --skip-handover-email`
+
+- Send only today’s already-created report log email:
+  - `python3 ftp_download_today.py --send-report-log-only`
+
+- Send only a selected date’s already-created report log email:
+  - `python3 ftp_download_today.py --send-report-log-only --date 20260529`
+
+- Send only a specific report log file:
+  - `python3 ftp_download_today.py --send-report-log-only --log-file downloads/report_20260529.txt`
+
 - Extrascreen only:
   - `python3 ftp_download_today.py --clean-only --skip-handover --update-extrascreen`
 
@@ -401,6 +453,8 @@ Console output shows:
 - verification workbook summary
 - handover report generation
 - handover email send status
+- handover report FTP upload status
+- completion log email send status
 
 Report log:
 
@@ -409,10 +463,23 @@ Report log:
 - custom path:
   - `python3 ftp_download_today.py --log-file logs/report.txt`
 
+Completion log email:
+
+- recipients:
+  - `helpdesk@iconis.co.za`
+  - `dev@iconis.co.za`
+- subject format:
+  - `LegalSuite Daily Reports Completed Log -- YYYY/MM/DD H:MM`
+- attachment:
+  - the generated `report_YYYYMMDD.txt`
+- retry behavior:
+  - up to 3 attempts total
+
 ## Notes
 
 - Missing file means the FTP directory exists but the expected file for that date was not found.
 - Missing directory means the target FTP folder itself was not present.
 - If a source file type is missing, that section is skipped naturally.
 - `--handover-email-test` is the safe way to test the report email path before using the live handover creation flow.
+- `send_test_email.py` supports `--profile test` and `--profile production` for separate SMTP settings in `.env`.
 - `handover_file_processing_test.py` remains useful as a standalone test harness, but the main daily behavior should now be driven through `ftp_download_today.py`.

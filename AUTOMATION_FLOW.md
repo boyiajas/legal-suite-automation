@@ -43,7 +43,7 @@ At an architectural level, the solution is organized as a staged integration pip
 - LegalSuite API
   - target system for matter, extrascreen, archive, reopen, party, and MatParty updates
 - report and communication layer
-  - creates text logs, handover Excel reports, and email notifications
+  - creates text logs, handover Excel reports, email notifications, and FTP drop-offs for the handover report
 
 ### Architectural Pattern
 
@@ -74,7 +74,7 @@ This makes the solution:
 - integration layer
   - LegalSuite API requests with retries and fallback handling
 - verification and reporting layer
-  - GET-after-update verification, logs, verification workbooks, handover report email
+  - GET-after-update verification, logs, verification workbooks, handover report email, and handover report FTP upload
 
 ## Field Mapping Overview
 
@@ -347,6 +347,10 @@ The report is then emailed to either:
 - the live business recipients, or
 - the test recipients when test email mode is enabled
 
+After a successful email send, the same report is uploaded to FTP into:
+
+- `Matter Ref Updates`
+
 ### 5. Daily Extrascreen Updates
 
 If extrascreen updating is enabled, the script processes cleaned:
@@ -487,6 +491,7 @@ The automation produces four main output categories.
 
 - handover Excel report
 - handover report email with attachment
+- handover report FTP upload to `Matter Ref Updates`
 
 ## Control Modes
 
@@ -538,6 +543,7 @@ The automation can be summarized as this flow:
 6. Verify every important LegalSuite change
 7. Record logs and verification evidence
 8. Send handover report email when relevant
+9. Upload the handover report to FTP when the email send succeeds
 
 ## Recommended Use of This Document
 

@@ -998,6 +998,31 @@ class LegalSuiteLookupClient:
         payload = response.json()
         return payload.get("data", [])
 
+    def get_parlang_by_partyid_and_languageid(self, partyid: int | str, languageid: int | str) -> list[dict]:
+        url = f"{self._api_base}/parlang/get"
+        data = [
+            ("where[]", f"ParLang.PartyID,=,{partyid}"),
+            ("where[]", f"ParLang.LanguageID,=,{languageid}"),
+        ]
+        response = post_with_retry(url, headers=self._headers(), data=data, timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("data", [])
+
+    def update_parlang(self, recordid: int | str, updates: dict) -> dict | str:
+        url = f"{self._api_base}/parlang/update"
+        payload = {
+            "recordid": str(recordid),
+        }
+        for key, value in updates.items():
+            payload[key] = str(value)
+        response = post_with_retry(url, headers=self._headers(), data=payload, timeout=60)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
+
     def update_matter_extrascreen(self, data: dict) -> dict | str:
         url = f"{self._api_base}/matdocsc/update"
         payload = {key: str(value) for key, value in data.items()}
@@ -1405,6 +1430,14 @@ def get_row_value(row: HandoverRow, header_name: str) -> object | None:
     return None
 
 
+def get_first_matching_row_value(row: HandoverRow, header_names: list[str]) -> object | None:
+    for header_name in header_names:
+        value = get_row_value(row, header_name)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 def build_debtor_name(row: HandoverRow) -> str | None:
     surname = normalize_cell_value(get_row_value(row, "Debtor Surname"))
     first_name = normalize_cell_value(get_row_value(row, "Debtor First Name"))
@@ -1554,6 +1587,7 @@ def build_party_create_payload(
     identity_number = digits_only(get_row_value(row, "ID Number"))
     if identity_number:
         payload["identitynumber"] = identity_number
+        payload["parlang[identitynumber]"] = identity_number
 
     add_party_parlang_value(payload, "salutation", get_row_value(row, "Debtor Title"))
     add_party_parlang_value(payload, "physicalline1", get_row_value(row, "Physical Address Line 1"))
@@ -1615,6 +1649,7 @@ def build_party_create_json_payload(
     identity_number = digits_only(get_row_value(row, "ID Number"))
     if identity_number:
         party["identitynumber"] = identity_number
+        parlang["identitynumber"] = identity_number
 
     return {
         "createdid": employee_recordid,
@@ -1630,6 +1665,36 @@ def build_party_update_payload(
 ) -> dict[str, object]:
     create_payload = build_party_create_payload(row, date_ctx, logged_in_employee_id)
     return {key: value for key, value in create_payload.items() if key != "createdid"}
+
+
+def build_parlang_update_payload(row: HandoverRow, parlang_row: dict) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "partyid": parlang_row.get("partyid"),
+        "languageid": parlang_row.get("languageid") or 1,
+    }
+
+    identity_number = digits_only(get_row_value(row, "ID Number"))
+    if identity_number:
+        payload["identitynumber"] = identity_number
+
+    first_name = normalize_cell_value(get_row_value(row, "Debtor First Name"))
+    if first_name not in (None, ""):
+        payload["firstname"] = first_name
+
+    title = normalize_cell_value(get_row_value(row, "Debtor Title"))
+    if title not in (None, ""):
+        payload["title"] = title
+
+    birthdate = normalize_cell_value(
+        get_first_matching_row_value(
+            row,
+            ["BirthDate", "Birth Date", "Date of Birth", "DOB"],
+        )
+    )
+    if birthdate not in (None, ""):
+        payload["birthdate"] = birthdate
+
+    return {key: value for key, value in payload.items() if value not in (None, "")}
 
 
 def build_partele_payloads(row: HandoverRow, partyid: int | str) -> list[tuple[str, dict[str, object]]]:
@@ -1792,6 +1857,41 @@ def sync_handover_party_contacts(
         created_partele = client.create_partele(partele_payload)
         partele_recordid = extract_created_recordid(created_partele)
         print(f"  Created {contact_label} contact recordid: {partele_recordid}")
+
+
+def sync_handover_parlang(
+    client: LegalSuiteLookupClient,
+    row: HandoverRow,
+    partyid: int | str,
+    dry_run: bool,
+) -> None:
+    parlang_rows = client.get_parlang_by_partyid_and_languageid(partyid, 1)
+    if not parlang_rows:
+        print(f"  No ParLang row found for partyid {partyid} languageid 1.")
+        return
+
+    parlang_row = parlang_rows[0]
+    payload = build_parlang_update_payload(row, parlang_row)
+    if "identitynumber" not in payload and "firstname" not in payload and "title" not in payload and "birthdate" not in payload:
+        print("  No ParLang identity/name fields to update.")
+        return
+
+    recordid = parlang_row.get("recordid")
+    if not recordid:
+        print(f"  ParLang row for partyid {partyid} has no recordid.")
+        return
+
+    if dry_run:
+        print(f"  Dry-run: would update ParLang recordid {recordid} for partyid {partyid}.")
+        print(json.dumps({"recordid": recordid, **payload}, indent=2, default=str))
+        return
+
+    print(f"  Updating ParLang recordid {recordid} for partyid {partyid}...")
+    client.update_parlang(recordid, payload)
+    print(
+        "  Updated ParLang: "
+        + ", ".join(sorted(key for key in payload if key not in {"partyid", "languageid"}))
+    )
 
 
 def build_matparty_create_payload(matterid: int | str, partyid: int | str) -> dict[str, object]:
@@ -2206,6 +2306,7 @@ def create_and_update_handover_matters(
                 print("  Updated debtor party (role 103)")
             else:
                 print("  Dry-run: would update debtor party (role 103).")
+            sync_handover_parlang(client, row, debtor_partyid, dry_run=not create_matters)
             sync_handover_party_contacts(client, row, debtor_partyid, dry_run=not create_matters)
             update_handover_row_desktop_extrascreens(client, row, existing_recordid, dry_run=not create_matters)
             continue
@@ -2275,6 +2376,7 @@ def create_and_update_handover_matters(
         print("  Resolving debtor partyid from MatParty role 103...")
         debtor_partyid = resolve_debtor_partyid_for_matter(client, recordid)
         print(f"  Resolved debtor partyid: {debtor_partyid}")
+        sync_handover_parlang(client, row, debtor_partyid, dry_run=False)
         sync_handover_party_contacts(client, row, debtor_partyid, dry_run=False)
 
         matter_after_matparty = fetch_matter_row(client, recordid)

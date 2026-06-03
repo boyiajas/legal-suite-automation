@@ -134,10 +134,23 @@ Examples include:
 - `Debtor Surname` + `Debtor First Name` -> `party[name]`
 - `Debtor Title` -> `party[parlang][salutation]`
 - `ID Number` -> `party[identitynumber]`
+- `ID Number` -> `party[parlang][identitynumber]`
 - physical address lines -> party physical address fields
 - postal address lines -> party postal address fields
 - home, work, and cell numbers -> party phone fields
 - `DefendantEmail` -> party email field
+
+After the party create or party reuse step, the automation now performs an explicit `ParLang` maintenance step:
+
+- `parlang/get` by `PartyID` and `LanguageID = 1`
+- `parlang/update` by `RecordID`, `PartyID`, and `LanguageID`
+
+The current explicit `ParLang` update writes:
+
+- `identitynumber` from `ID Number`
+- `firstname` from `Debtor First Name`
+- `title` from `Debtor Title`
+- `birthdate` when a supported birthdate column exists in the source row
 
 ### Daily Extrascreen Mapping
 
@@ -331,8 +344,9 @@ At an abstract level, the handover flow does the following:
 5. create a new matter when appropriate
 6. update selected matter fields after creation
 7. create or reuse the debtor party
-8. create or reuse the MatParty link between the matter and party
-9. update Desktop Extra Screen data for the new or matched matter when handover extrascreen values exist
+8. explicitly update the related `ParLang` row for language `1`
+9. create or reuse the MatParty link between the matter and party
+10. update Desktop Extra Screen data for the new or matched matter when handover extrascreen values exist
 
 The handover flow also generates an operational report of newly created matters.
 

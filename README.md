@@ -159,12 +159,31 @@ What the handover flow does:
 8. creates or reuses the debtor party
 9. creates or reuses the MatParty link
 10. resolves the debtor party through `MatParty` role `103`
-11. updates only that debtor party when the matter already exists
-12. creates missing party contacts using `partele/store`
-13. updates Desktop Extra Screen data from the handover row when present
-14. generates an Excel report
-15. emails the handover report with the Excel attached unless `--skip-handover-email` is used
-16. uploads the handover report to FTP into `Matter Ref Updates`
+11. updates the debtor party details
+12. fetches the existing `ParLang` row for that party using `partyid` and `languageid = 1`
+13. updates that `ParLang` row using `parlang/update`
+14. creates missing party contacts using `partele/store`
+15. updates Desktop Extra Screen data from the handover row when present
+16. generates an Excel report
+17. emails the handover report with the Excel attached unless `--skip-handover-email` is used
+18. uploads the handover report to FTP into `Matter Ref Updates`
+
+Handover party storage behavior:
+
+- the party create step stores:
+  - `identitynumber`
+  - `parlang[name]`
+  - `parlang[identitynumber]`
+  - `parlang[salutation]`
+  - physical and postal address fields
+- after party creation or party reuse, the script now also does:
+  - `parlang/get` using `partyid` and `languageid = 1`
+  - `parlang/update` using `recordid`, `partyid`, and `languageid`
+- the explicit `ParLang` update currently writes these fields when present from the handover row:
+  - `identitynumber` from `ID Number`
+  - `firstname` from `Debtor First Name`
+  - `title` from `Debtor Title`
+  - `birthdate` from `BirthDate`, `Birth Date`, `Date of Birth`, or `DOB`
 
 Handover report columns:
 
@@ -196,6 +215,20 @@ Live handover report recipients:
 - Cc:
   - `agashnee.pillay@iconis.co.za`
   - `thileshnee.chinnasamy@iconis.co.za`
+
+What happens when the matter already exists:
+
+- the script matches existing matters by:
+  - `FileRef` first
+  - then `ClientID + Reference`
+- it does not create a new matter
+- it does not run the normal matter create/update payload
+- it still:
+  - resolves or creates the debtor `MatParty` role `103`
+  - updates the debtor party
+  - updates the matching `ParLang` row
+  - creates missing party contacts
+  - updates handover desktop extrascreens
 
 Handover options:
 

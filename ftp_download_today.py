@@ -1438,13 +1438,31 @@ def get_first_matching_row_value(row: HandoverRow, header_names: list[str]) -> o
     return None
 
 
-def build_debtor_name(row: HandoverRow) -> str | None:
+def build_debtor_surname(row: HandoverRow) -> str | None:
     surname = normalize_cell_value(get_row_value(row, "Debtor Surname"))
+    if surname in (None, ""):
+        return None
+    return str(surname)
+
+
+def build_debtor_first_name(row: HandoverRow) -> str | None:
     first_name = normalize_cell_value(get_row_value(row, "Debtor First Name"))
-    name_parts = [str(value) for value in (surname, first_name) if value not in (None, "")]
+    if first_name in (None, ""):
+        return None
+    return str(first_name)
+
+
+def build_debtor_name(row: HandoverRow) -> str | None:
+    surname = build_debtor_surname(row)
+    first_name = build_debtor_first_name(row)
+    name_parts = [value for value in (surname, first_name) if value not in (None, "")]
     if name_parts:
         return " ".join(name_parts)
     return None
+
+
+def build_parlang_name(row: HandoverRow) -> str | None:
+    return build_debtor_surname(row) or build_description(row)
 
 
 def build_description(row: HandoverRow) -> str:
@@ -1570,6 +1588,7 @@ def build_party_create_payload(
 ) -> dict[str, object]:
     now = dt.datetime.now()
     name = build_debtor_name(row) or build_description(row)
+    parlang_name = build_parlang_name(row)
     imported_date = dt.datetime.strptime(date_ctx.date_str, "%Y%m%d")
     notes = f"Imported on {imported_date.strftime('%d %B %Y')}"
     employee_recordid = normalize_employee_recordid(logged_in_employee_id)
@@ -1582,7 +1601,7 @@ def build_party_create_payload(
     payload["updatedbytime"] = encode_legalsuite_time(now)
     payload["createdid"] = employee_recordid
     payload["notes"] = notes
-    payload["parlang[name]"] = name
+    payload["parlang[name]"] = parlang_name
 
     identity_number = digits_only(get_row_value(row, "ID Number"))
     if identity_number:
@@ -1608,6 +1627,7 @@ def build_party_create_json_payload(
 ) -> dict[str, object]:
     now = dt.datetime.now()
     name = build_debtor_name(row) or build_description(row)
+    parlang_name = build_parlang_name(row)
     imported_date = dt.datetime.strptime(date_ctx.date_str, "%Y%m%d")
     notes = f"Imported on {imported_date.strftime('%d %B %Y')}"
     employee_recordid = normalize_employee_recordid(logged_in_employee_id)
@@ -1619,6 +1639,8 @@ def build_party_create_json_payload(
     parlang = {
         "languageid": 1,
     }
+    if parlang_name not in (None, ""):
+        parlang["name"] = parlang_name
     for field_name, header_name in (
         ("salutation", "Debtor Title"),
         ("physicalline1", "Physical Address Line 1"),
@@ -1673,11 +1695,15 @@ def build_parlang_update_payload(row: HandoverRow, parlang_row: dict) -> dict[st
         "languageid": parlang_row.get("languageid") or 1,
     }
 
+    surname = build_debtor_surname(row)
+    if surname not in (None, ""):
+        payload["name"] = surname
+
     identity_number = digits_only(get_row_value(row, "ID Number"))
     if identity_number:
         payload["identitynumber"] = identity_number
 
-    first_name = normalize_cell_value(get_row_value(row, "Debtor First Name"))
+    first_name = build_debtor_first_name(row)
     if first_name not in (None, ""):
         payload["firstname"] = first_name
 
@@ -1872,7 +1898,13 @@ def sync_handover_parlang(
 
     parlang_row = parlang_rows[0]
     payload = build_parlang_update_payload(row, parlang_row)
-    if "identitynumber" not in payload and "firstname" not in payload and "title" not in payload and "birthdate" not in payload:
+    if (
+        "name" not in payload
+        and "identitynumber" not in payload
+        and "firstname" not in payload
+        and "title" not in payload
+        and "birthdate" not in payload
+    ):
         print("  No ParLang identity/name fields to update.")
         return
 

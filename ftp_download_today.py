@@ -176,12 +176,12 @@ CREATE_DEFAULTS = {
     "mattertypeid": 4,
     "clientfeesheetid": 1,
     "docgenid": 5,
-    "costcentreid": 193,
+    "costcentreid": 541,
     "todogroupid": 1,
     "stagegroupid": 59,
     "debtorfeesheetid": 45,
     "businessbankid": 1103,
-    "trustbankid": 1198,
+    "trustbankid": 1201,
     "employeeid": 174,
     "loggedinemployeeid": 174,
     "archivestatusdescription": "LIVE",
@@ -1118,6 +1118,25 @@ def digits_only(value: object) -> str | None:
     return digits or None
 
 
+def normalize_identity_number(value: object) -> str | None:
+    return digits_only(value)
+
+
+def infer_partytypeid_from_sa_identity_number(value: object) -> int | None:
+    identity_number = normalize_identity_number(value)
+    if not identity_number or len(identity_number) != 13:
+        return None
+    gender_sequence = identity_number[6:10]
+    if not gender_sequence.isdigit():
+        return None
+    sequence_value = int(gender_sequence)
+    if 0 <= sequence_value <= 4999:
+        return 2
+    if 5000 <= sequence_value <= 9999:
+        return 1
+    return None
+
+
 def encode_legalsuite_date(value: object) -> int | None:
     if value in (None, ""):
         return None
@@ -1603,7 +1622,11 @@ def build_party_create_payload(
     payload["notes"] = notes
     payload["parlang[name]"] = parlang_name
 
-    identity_number = digits_only(get_row_value(row, "ID Number"))
+    identity_number = normalize_identity_number(get_row_value(row, "ID Number"))
+    partytypeid = infer_partytypeid_from_sa_identity_number(identity_number)
+    if partytypeid is not None:
+        payload["partytypeid"] = partytypeid
+        payload["parlang[partytypeid]"] = partytypeid
     if identity_number:
         payload["identitynumber"] = identity_number
         payload["parlang[identitynumber]"] = identity_number
@@ -1668,7 +1691,11 @@ def build_party_create_json_payload(
         "parlang": parlang,
     }
 
-    identity_number = digits_only(get_row_value(row, "ID Number"))
+    identity_number = normalize_identity_number(get_row_value(row, "ID Number"))
+    partytypeid = infer_partytypeid_from_sa_identity_number(identity_number)
+    if partytypeid is not None:
+        party["partytypeid"] = partytypeid
+        parlang["partytypeid"] = partytypeid
     if identity_number:
         party["identitynumber"] = identity_number
         parlang["identitynumber"] = identity_number
@@ -1699,7 +1726,7 @@ def build_parlang_update_payload(row: HandoverRow, parlang_row: dict) -> dict[st
     if surname not in (None, ""):
         payload["name"] = surname
 
-    identity_number = digits_only(get_row_value(row, "ID Number"))
+    identity_number = normalize_identity_number(get_row_value(row, "ID Number"))
     if identity_number:
         payload["identitynumber"] = identity_number
 
@@ -1773,7 +1800,7 @@ def create_or_reuse_handover_party(
     logged_in_employee_id: str,
 ) -> tuple[str, bool]:
     party_payload = build_party_create_payload(row, date_ctx, logged_in_employee_id)
-    identity_number = digits_only(get_row_value(row, "ID Number"))
+    identity_number = normalize_identity_number(get_row_value(row, "ID Number"))
     existing_party = None
     if identity_number:
         matches = client.get_party_by_identitynumber(identity_number)
@@ -2026,7 +2053,7 @@ def dump_handover_row_payloads_and_stop(
         "matter_update_payload": matter_update_payload,
         "party_lookup_by_identitynumber": (
             {"where[]": f"Party.IdentityNumber,=,{identity_number}"}
-            if (identity_number := digits_only(get_row_value(row, "ID Number")))
+            if (identity_number := normalize_identity_number(get_row_value(row, "ID Number")))
             else None
         ),
         "party_create_form_payload": party_payload,

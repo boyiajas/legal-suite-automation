@@ -3327,13 +3327,12 @@ class App:
         worksheet.title = "Handover Report"
         worksheet.append(
             [
-                "Matter File Reference",
-                "Their Reference",
-                "Matter Description",
+                "Matter File Ref",
+                "Their Ref",
             ]
         )
         for item in created_matters:
-            worksheet.append([item.file_ref, item.their_reference, item.description])
+            worksheet.append([item.file_ref, item.their_reference])
         workbook.save(report_path)
         workbook.close()
         return report_path

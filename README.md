@@ -11,6 +11,27 @@
 - reopening matters from reopen files
 - verifying that LegalSuite updates actually stuck after each update call
 
+## Python modules to install
+
+`ftp_download_today.py` uses Python standard library modules plus these third-party packages:
+
+- `requests`
+- `openpyxl`
+
+Install them with:
+
+```bash
+python3 -m pip install requests openpyxl
+```
+
+Optional virtual environment setup:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install requests openpyxl
+```
+
 ## Configuration
 
 Credentials are loaded from `.env`.

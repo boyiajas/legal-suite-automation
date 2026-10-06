@@ -293,6 +293,10 @@ class HandoverDebugStop(Exception):
     pass
 
 
+class PartyCodeExhaustedError(ValueError):
+    pass
+
+
 @dataclass
 class VerificationWorkbookState:
     source_path: str
@@ -954,12 +958,13 @@ class LegalSuiteLookupClient:
     def get_party_by_matterprefix(self, matterprefix: str) -> list[dict]:
         url = f"{self._api_base}/party/get"
         data = {
-            "where[]": f"Party.MatterPrefix,=,{matterprefix}",
+            "where[]": f"Party.Code,=,{matterprefix}",
         }
         response = post_with_retry(url, headers=self._headers(), data=data, timeout=60)
         response.raise_for_status()
         payload = response.json()
-        return payload.get("data", [])
+        rows = payload.get("data", [])
+        return [row for row in rows if party_code_from_api_row(row) == matterprefix.upper()]
 
     def get_matparty_by_matter_and_party(self, matter_id: int | str, party_id: int | str) -> list[dict]:
         url = f"{self._api_base}/matparty/get"
@@ -1534,14 +1539,26 @@ def normalized_party_match_value(value: object) -> str:
     return " ".join(str(value or "").strip().upper().split())
 
 
+def party_api_value(party: dict, *field_names: str) -> object | None:
+    wanted = {field_name.lower() for field_name in field_names}
+    for key, value in party.items():
+        if str(key).lower() in wanted:
+            return value
+    return None
+
+
+def party_code_from_api_row(party: dict) -> str:
+    return normalized_party_match_value(party_api_value(party, "code", "matterprefix"))
+
+
 def party_matches_handover_row(party: dict, row: HandoverRow) -> bool:
     expected_identity = normalize_identity_number(get_row_value(row, "ID Number"))
-    actual_identity = normalize_identity_number(party.get("identitynumber"))
+    actual_identity = normalize_identity_number(party_api_value(party, "identitynumber"))
     if expected_identity:
         return actual_identity == expected_identity
 
     expected_name = normalized_party_match_value(build_debtor_name(row) or build_description(row))
-    actual_name = normalized_party_match_value(party.get("name"))
+    actual_name = normalized_party_match_value(party_api_value(party, "name"))
     return bool(expected_name and actual_name == expected_name)
 
 
@@ -1847,7 +1864,7 @@ def create_or_reuse_handover_party(
             existing_party = matches[0]
 
     if existing_party:
-        partyid = str(existing_party["recordid"])
+        partyid = str(party_api_value(existing_party, "recordid"))
         print(f"  Reusing existing partyid: {partyid}")
         return partyid, False
 
@@ -1865,7 +1882,7 @@ def create_or_reuse_handover_party(
                 None,
             )
             if matching_party:
-                partyid = str(matching_party["recordid"])
+                partyid = str(party_api_value(matching_party, "recordid"))
                 print(f"  Reusing existing partyid {partyid} for matching code {candidate_prefix}")
                 return partyid, False
             print(f"  Party code {candidate_prefix} belongs to different data; trying another code.")
@@ -1881,7 +1898,7 @@ def create_or_reuse_handover_party(
                 None,
             )
             if matching_party:
-                partyid = str(matching_party["recordid"])
+                partyid = str(party_api_value(matching_party, "recordid"))
                 print(f"  Reusing existing partyid {partyid} for matching code {candidate_prefix}")
                 return partyid, False
             print(f"  Party code {candidate_prefix} was taken by different data; trying another code.")
@@ -1903,7 +1920,7 @@ def create_or_reuse_handover_party(
                     None,
                 )
                 if matching_party:
-                    partyid = str(matching_party["recordid"])
+                    partyid = str(party_api_value(matching_party, "recordid"))
                     print(f"  Reusing existing partyid {partyid} for matching code {candidate_prefix}")
                     return partyid, False
                 print(f"  Party code {candidate_prefix} was taken by different data; trying another code.")
@@ -1912,7 +1929,7 @@ def create_or_reuse_handover_party(
         print(f"  Created partyid: {partyid}")
         return partyid, True
 
-    raise ValueError(
+    raise PartyCodeExhaustedError(
         f"Could not find an available party code after {max_code_attempts} attempts starting at {base_prefix}."
     )
 
@@ -2432,14 +2449,18 @@ def create_and_update_handover_matters(
                 f"theirref {existing_matter.get('theirref')}"
             )
             print("  Resolving debtor partyid from MatParty role 103...")
-            debtor_partyid = ensure_debtor_party_for_matter(
-                client,
-                row,
-                existing_recordid,
-                date_ctx,
-                logged_in_employee_id,
-                dry_run=not create_matters,
-            )
+            try:
+                debtor_partyid = ensure_debtor_party_for_matter(
+                    client,
+                    row,
+                    existing_recordid,
+                    date_ctx,
+                    logged_in_employee_id,
+                    dry_run=not create_matters,
+                )
+            except PartyCodeExhaustedError as exc:
+                print(f"  Skipped handover row: {exc}")
+                continue
             if not debtor_partyid:
                 update_handover_row_desktop_extrascreens(client, row, existing_recordid, dry_run=not create_matters)
                 continue
@@ -2505,7 +2526,11 @@ def create_and_update_handover_matters(
             print("  No tracked matter fields changed after description update.")
 
         print("  Checking for existing party...")
-        partyid, _ = create_or_reuse_handover_party(client, row, date_ctx, logged_in_employee_id)
+        try:
+            partyid, _ = create_or_reuse_handover_party(client, row, date_ctx, logged_in_employee_id)
+        except PartyCodeExhaustedError as exc:
+            print(f"  Skipped remaining handover steps for this matter: {exc}")
+            continue
 
         print("  Checking MatParty link...")
         existing_matparty = client.get_matparty_by_matter_and_party(recordid, partyid)

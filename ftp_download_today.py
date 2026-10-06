@@ -830,6 +830,11 @@ def is_parlang_missing_error(result: dict | str) -> bool:
     return "no parlang record was sent" in error_text and "party->parlang" in error_text
 
 
+def is_party_code_duplicate_error(result: dict | str) -> bool:
+    error_text = extract_update_error_text(result).lower()
+    return "already has this code" in error_text
+
+
 class LegalSuiteLookupClient:
     def __init__(self, api_base: str, api_key: str) -> None:
         self._api_base = api_base.rstrip("/")
@@ -940,6 +945,16 @@ class LegalSuiteLookupClient:
         url = f"{self._api_base}/party/get"
         data = {
             "where[]": f"Party.IdentityNumber,=,{identity_number}",
+        }
+        response = post_with_retry(url, headers=self._headers(), data=data, timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("data", [])
+
+    def get_party_by_matterprefix(self, matterprefix: str) -> list[dict]:
+        url = f"{self._api_base}/party/get"
+        data = {
+            "where[]": f"Party.MatterPrefix,=,{matterprefix}",
         }
         response = post_with_retry(url, headers=self._headers(), data=data, timeout=60)
         response.raise_for_status()
@@ -1506,6 +1521,30 @@ def build_party_prefix(row: HandoverRow) -> str:
     return f"{prefix}{suffix}"
 
 
+def increment_party_prefix(base_prefix: str, attempt: int) -> str:
+    match = re.fullmatch(r"(.*?)(\d+)", base_prefix)
+    if not match:
+        return f"{base_prefix}{attempt}"
+    text_prefix, digits = match.groups()
+    next_number = int(digits) + attempt
+    return f"{text_prefix}{next_number:0{len(digits)}d}"
+
+
+def normalized_party_match_value(value: object) -> str:
+    return " ".join(str(value or "").strip().upper().split())
+
+
+def party_matches_handover_row(party: dict, row: HandoverRow) -> bool:
+    expected_identity = normalize_identity_number(get_row_value(row, "ID Number"))
+    actual_identity = normalize_identity_number(party.get("identitynumber"))
+    if expected_identity:
+        return actual_identity == expected_identity
+
+    expected_name = normalized_party_match_value(build_debtor_name(row) or build_description(row))
+    actual_name = normalized_party_match_value(party.get("name"))
+    return bool(expected_name and actual_name == expected_name)
+
+
 def build_matter_create_payload(
     row: HandoverRow,
     file_ref: str,
@@ -1815,20 +1854,67 @@ def create_or_reuse_handover_party(
     party_createdid = str(party_payload.get("createdid") or "").strip()
     if not party_createdid:
         raise ValueError("Party payload is missing CreatedId for handover party creation.")
-    print("  Creating party...")
-    created_party = client.create_party(party_payload)
-    try:
-        partyid = extract_created_recordid(created_party)
-    except ValueError:
-        if not is_parlang_missing_error(created_party):
-            raise
-        print("  Retrying party create with nested Party->ParLang JSON payload...")
-        created_party = client.create_party_json(
-            build_party_create_json_payload(row, date_ctx, logged_in_employee_id)
-        )
-        partyid = extract_created_recordid(created_party)
-    print(f"  Created partyid: {partyid}")
-    return partyid, True
+    base_prefix = str(party_payload["matterprefix"])
+    max_code_attempts = 100
+    for attempt in range(max_code_attempts):
+        candidate_prefix = increment_party_prefix(base_prefix, attempt)
+        existing_code_matches = client.get_party_by_matterprefix(candidate_prefix)
+        if existing_code_matches:
+            matching_party = next(
+                (party for party in existing_code_matches if party_matches_handover_row(party, row)),
+                None,
+            )
+            if matching_party:
+                partyid = str(matching_party["recordid"])
+                print(f"  Reusing existing partyid {partyid} for matching code {candidate_prefix}")
+                return partyid, False
+            print(f"  Party code {candidate_prefix} belongs to different data; trying another code.")
+            continue
+
+        candidate_payload = {**party_payload, "matterprefix": candidate_prefix}
+        print(f"  Creating party with code {candidate_prefix}...")
+        created_party = client.create_party(candidate_payload)
+        if is_party_code_duplicate_error(created_party):
+            race_matches = client.get_party_by_matterprefix(candidate_prefix)
+            matching_party = next(
+                (party for party in race_matches if party_matches_handover_row(party, row)),
+                None,
+            )
+            if matching_party:
+                partyid = str(matching_party["recordid"])
+                print(f"  Reusing existing partyid {partyid} for matching code {candidate_prefix}")
+                return partyid, False
+            print(f"  Party code {candidate_prefix} was taken by different data; trying another code.")
+            continue
+
+        try:
+            partyid = extract_created_recordid(created_party)
+        except ValueError:
+            if not is_parlang_missing_error(created_party):
+                raise
+            print("  Retrying party create with nested Party->ParLang JSON payload...")
+            json_payload = build_party_create_json_payload(row, date_ctx, logged_in_employee_id)
+            json_payload["party"]["matterprefix"] = candidate_prefix
+            created_party = client.create_party_json(json_payload)
+            if is_party_code_duplicate_error(created_party):
+                race_matches = client.get_party_by_matterprefix(candidate_prefix)
+                matching_party = next(
+                    (party for party in race_matches if party_matches_handover_row(party, row)),
+                    None,
+                )
+                if matching_party:
+                    partyid = str(matching_party["recordid"])
+                    print(f"  Reusing existing partyid {partyid} for matching code {candidate_prefix}")
+                    return partyid, False
+                print(f"  Party code {candidate_prefix} was taken by different data; trying another code.")
+                continue
+            partyid = extract_created_recordid(created_party)
+        print(f"  Created partyid: {partyid}")
+        return partyid, True
+
+    raise ValueError(
+        f"Could not find an available party code after {max_code_attempts} attempts starting at {base_prefix}."
+    )
 
 
 def ensure_debtor_party_for_matter(

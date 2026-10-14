@@ -958,13 +958,23 @@ class LegalSuiteLookupClient:
     def get_party_by_matterprefix(self, matterprefix: str) -> list[dict]:
         url = f"{self._api_base}/party/get"
         data = {
-            "where[]": f"Party.Code,=,{matterprefix}",
+            "where[]": f"Party.MatterPrefix,=,{matterprefix}",
         }
         response = post_with_retry(url, headers=self._headers(), data=data, timeout=60)
         response.raise_for_status()
         payload = response.json()
         rows = payload.get("data", [])
         return [row for row in rows if party_code_from_api_row(row) == matterprefix.upper()]
+
+    def get_parties_by_matterprefix_prefix(self, prefix: str) -> list[dict]:
+        url = f"{self._api_base}/party/get"
+        data = {
+            "where[]": f"Party.MatterPrefix,like,{prefix}%",
+        }
+        response = post_with_retry(url, headers=self._headers(), data=data, timeout=120)
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("data", [])
 
     def get_matparty_by_matter_and_party(self, matter_id: int | str, party_id: int | str) -> list[dict]:
         url = f"{self._api_base}/matparty/get"
@@ -1535,6 +1545,29 @@ def increment_party_prefix(base_prefix: str, attempt: int) -> str:
     return f"{text_prefix}{next_number:0{len(digits)}d}"
 
 
+def next_party_prefix_for_sequence(client: LegalSuiteLookupClient, generated_prefix: str) -> str:
+    match = re.fullmatch(r"([A-Z]+)(\d+)", generated_prefix.upper())
+    if not match:
+        return generated_prefix
+
+    text_prefix, generated_digits = match.groups()
+    sequence_rows = client.get_parties_by_matterprefix_prefix(text_prefix)
+    highest_number = 0
+    width = len(generated_digits)
+    for party in sequence_rows:
+        existing_code = party_code_from_api_row(party)
+        existing_match = re.fullmatch(rf"{re.escape(text_prefix)}(\d+)", existing_code)
+        if not existing_match:
+            continue
+        digits = existing_match.group(1)
+        highest_number = max(highest_number, int(digits))
+        width = max(width, len(digits))
+
+    if highest_number == 0:
+        return generated_prefix
+    return f"{text_prefix}{highest_number + 1:0{width}d}"
+
+
 def normalized_party_match_value(value: object) -> str:
     return " ".join(str(value or "").strip().upper().split())
 
@@ -1871,7 +1904,10 @@ def create_or_reuse_handover_party(
     party_createdid = str(party_payload.get("createdid") or "").strip()
     if not party_createdid:
         raise ValueError("Party payload is missing CreatedId for handover party creation.")
-    base_prefix = str(party_payload["matterprefix"])
+    generated_prefix = str(party_payload["matterprefix"])
+    base_prefix = next_party_prefix_for_sequence(client, generated_prefix)
+    if base_prefix != generated_prefix:
+        print(f"  Existing {generated_prefix[:3]} party-code sequence found; starting at {base_prefix}.")
     max_code_attempts = 100
     for attempt in range(max_code_attempts):
         candidate_prefix = increment_party_prefix(base_prefix, attempt)
